@@ -43,14 +43,15 @@ body {
 .logo { font-size: 16px; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px; }
 .logo::before { content: ''; width: 9px; height: 9px; border-radius: 50%; background: var(--idle); animation: pulse-dot 2s infinite; }
 @keyframes pulse-dot { 0%, 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0.4); } 50% { box-shadow: 0 0 0 8px rgba(63,185,80,0); } }
-.topbar-stats { display: flex; gap: 18px; font-size: 12px; color: var(--text-muted); }
+.topbar-stats { display: flex; gap: 18px; font-size: 12px; color: var(--text-muted); align-items: center; }
 .stat-badge { background: var(--bg-card); padding: 1px 7px; border-radius: 10px; font-weight: 600; color: var(--text); border: 1px solid var(--border); }
 .ws-status { display: flex; align-items: center; gap: 5px; font-size: 12px; padding: 3px 10px; border-radius: 5px; background: var(--bg-card); border: 1px solid var(--border); }
 .ws-status.connected { border-color: var(--idle); color: var(--idle); }
 .ws-status.disconnected { border-color: var(--danger); color: var(--danger); }
 .ws-status.connecting { border-color: var(--busy); color: var(--busy); }
 .ws-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.container { display: grid; grid-template-columns: 260px 1fr 360px; grid-template-rows: 1fr auto; gap: 1px; background: var(--border); min-height: calc(100vh - 47px); }
+#team-select { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; font-size: 12px; }
+.container { display: grid; grid-template-columns: 280px 1fr 360px; grid-template-rows: 1fr auto; gap: 1px; background: var(--border); min-height: calc(100vh - 47px); }
 .panel { background: var(--bg); overflow: hidden; display: flex; flex-direction: column; }
 .panel-header { background: var(--bg-raised); padding: 10px 14px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .panel-body { flex: 1; overflow-y: auto; padding: 10px; }
@@ -66,10 +67,12 @@ body {
 .status-dot.busy { background: var(--busy); animation: busy-blink 1.4s infinite; }
 .status-dot.asking_human { background: var(--human); animation: busy-blink 1.8s infinite; }
 @keyframes busy-blink { 0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,0.5);} 50%{box-shadow:0 0 0 8px rgba(245,158,11,0);} }
-.agent-meta { display: flex; gap: 10px; font-size: 11px; color: var(--text-muted); margin-top: 5px; }
+.agent-meta { display: flex; gap: 10px; font-size: 11px; color: var(--text-muted); margin-top: 5px; flex-wrap: wrap; }
 .queue-badge { background: var(--bg); padding: 1px 7px; border-radius: 10px; font-weight: 600; font-size: 10px; color: var(--accent); border: 1px solid var(--border); }
 .queue-badge.pop { animation: pop-badge 0.4s ease-out; }
 @keyframes pop-badge { 50%{ transform: scale(1.3); background: var(--accent); color: white; } }
+.peer-tag { font-size: 9px; background: rgba(88,166,255,0.12); color: var(--accent); padding: 1px 5px; border-radius: 3px; }
+.peer-tag.empty { background: rgba(139,148,158,0.1); color: var(--text-muted); }
 .network-container { position: relative; height: 320px; background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 10px; overflow: hidden; }
 .network-title { position: absolute; top: 10px; left: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); z-index: 10; pointer-events: none; }
 #network-svg { width: 100%; height: 100%; }
@@ -110,6 +113,7 @@ body {
 .event-line.conversation_complete { border-left-color: var(--idle); }
 .event-line.error { border-left-color: var(--danger); }
 .event-line.human_waiting { border-left-color: var(--human); }
+.event-line.link_violation { border-left-color: var(--danger); }
 .ev-tag { min-width: 90px; flex-shrink: 0; font-weight: 600; font-size: 10px; opacity: 0.8; }
 .ev-time { color: var(--text-muted); min-width: 55px; flex-shrink: 0; }
 .ev-desc { word-break: break-word; opacity: 0.9; }
@@ -125,12 +129,24 @@ body {
 .btn:active { transform: translateY(0); }
 .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
 .btn-secondary:hover { border-color: var(--accent); }
+.btn-danger { background: var(--danger); border: 1px solid var(--danger); color: white; }
+.btn-danger:hover { filter: brightness(1.15); }
+.btn-sm { padding: 4px 8px; font-size: 10px; width: auto; }
+.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 200; display: none; align-items: center; justify-content: center; }
+.modal-bg.show { display: flex; }
+.modal { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px; width: 420px; max-width: 90vw; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column; }
+.modal-header { padding: 14px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px; }
+.modal-body { padding: 14px 16px; overflow-y: auto; flex: 1; }
+.modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 30px 16px; color: var(--text-muted); font-size: 12px; text-align: center; }
 .empty-state-icon { font-size: 26px; margin-bottom: 8px; opacity: 0.4; }
-@media (max-width: 1100px) { .container { grid-template-columns: 220px 1fr 300px; } }
+.agent-actions { display: flex; gap: 4px; margin-top: 6px; }
+.link-editor-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.link-editor-row select { flex: 1; }
+@media (max-width: 1100px) { .container { grid-template-columns: 260px 1fr 300px; } }
 @media (max-width: 800px) { .container { grid-template-columns: 1fr; grid-template-rows: auto auto auto auto; } }
 </style>
 </head>
@@ -143,20 +159,47 @@ body {
         <span>Queued <span class="stat-badge" id="stat-queued">0</span></span>
         <span>Events <span class="stat-badge" id="stat-events">0</span></span>
     </div>
-    <div class="ws-status disconnected" id="ws-status"><span class="ws-dot"></span><span id="ws-text">Disconnected</span></div>
+    <div style="display:flex;align-items:center;gap:12px">
+        <select id="team-select" onchange="changeTeam(this.value)"><option value="">Loading teams...</option></select>
+        <div class="ws-status disconnected" id="ws-status"><span class="ws-dot"></span><span id="ws-text">Disconnected</span></div>
+    </div>
 </div>
 
 <div class="container">
-    <div class="panel"><div class="panel-header">Agents <span style="font-size:10px;color:var(--text-muted)">Click to inspect</span></div><div class="panel-body" id="agent-list"><div class="empty-state"><div class="empty-state-icon">🔍</div><div>Waiting...</div></div></div></div>
-    <div class="panel"><div class="panel-header">Network <span style="font-size:10px;color:var(--text-muted)" id="net-info">No data</span></div><div class="panel-body">
-        <div class="network-container"><div class="network-title">Live Network</div><svg id="network-svg" viewBox="0 0 580 300"></svg></div>
-        <div class="queue-viz"><div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="controls-title" style="margin:0">Task Queues</span><span style="font-size:10px;color:var(--text-muted)" id="sweep-timer">Next sweep in 10s</span></div><div class="queue-bars" id="queue-bars"></div></div>
-    </div></div>
-    <div class="panel" style="display:flex;flex-direction:column"><div class="panel-header"><span id="msg-header">Messages</span><span style="font-size:10px;color:var(--text-muted)" id="msg-count">0</span></div><div class="panel-body" id="message-list" style="flex:1;overflow-y:auto"><div class="empty-state"><div class="empty-state-icon">💬</div><div>Select an agent</div></div></div>
+    <div class="panel">
+        <div class="panel-header">
+            <span>Agents</span>
+            <button class="btn btn-sm btn-secondary" onclick="showAddAgent()">+ Add</button>
+        </div>
+        <div class="panel-body" id="agent-list">
+            <div class="empty-state"><div class="empty-state-icon">🔍</div><div>Select a team</div></div>
+        </div>
+    </div>
+    <div class="panel">
+        <div class="panel-header">Network <span style="font-size:10px;color:var(--text-muted)" id="net-info">No data</span></div>
+        <div class="panel-body">
+            <div class="network-container"><div class="network-title">Live Network</div><svg id="network-svg" viewBox="0 0 580 300"></svg></div>
+            <div style="display:flex;gap:8px;margin-bottom:10px">
+                <button class="btn btn-sm btn-secondary" style="flex:1" onclick="showLinkEditor()">🔗 Edit Links</button>
+                <button class="btn btn-sm btn-secondary" style="flex:1" onclick="showAddTeam()">+ New Team</button>
+            </div>
+            <div class="queue-viz"><div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="controls-title" style="margin:0">Task Queues</span><span style="font-size:10px;color:var(--text-muted)" id="sweep-timer">Next sweep in 10s</span></div><div class="queue-bars" id="queue-bars"></div></div>
+        </div>
+    </div>
+    <div class="panel" style="display:flex;flex-direction:column">
+        <div class="panel-header"><span id="msg-header">Messages</span><span style="font-size:10px;color:var(--text-muted)" id="msg-count">0</span></div>
+        <div class="panel-body" id="message-list" style="flex:1;overflow-y:auto"><div class="empty-state"><div class="empty-state-icon">💬</div><div>Select an agent</div></div></div>
         <div class="controls-section">
             <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Manual Controls</div>
-            <div style="margin-bottom:6px"><select class="control-input" id="ctrl-target"></select></div>
-            <div style="margin-bottom:6px"><textarea class="control-textarea" id="ctrl-payload" placeholder="Message or task..." style="min-height:40px"></textarea></div>
+            <div class="control-group">
+                <span class="control-label">From</span>
+                <select class="control-select" id="ctrl-source" onchange="updateTarget()"></select>
+            </div>
+            <div class="control-group">
+                <span class="control-label">To</span>
+                <select class="control-select" id="ctrl-target"></select>
+            </div>
+            <div style="margin-bottom:6px"><textarea class="control-textarea" id="ctrl-payload" placeholder="Message or task..."></textarea></div>
             <button class="btn" onclick="sendTask()">Send Task</button>
             <div style="margin-top:5px;display:flex;gap:5px"><button class="btn btn-secondary" style="flex:1" onclick="refreshData()">Refresh</button><button class="btn btn-secondary" style="flex:1" onclick="clearLog()">Clear</button></div>
         </div>
@@ -167,7 +210,50 @@ body {
     </div>
 </div>
 
+<!-- Add Agent Modal -->
+<div class="modal-bg" id="modal-add-agent">
+    <div class="modal">
+        <div class="modal-header">Add Agent</div>
+        <div class="modal-body">
+            <div class="control-group"><span class="control-label">Agent ID (slug)</span><input class="control-input" id="add-agent-id" placeholder="e.g., researcher_2"></div>
+            <div class="control-group"><span class="control-label">Display Name</span><input class="control-input" id="add-agent-name" placeholder="e.g., Researcher Agent 2"></div>
+            <div class="control-group"><span class="control-label">Allowed Peers (comma-separated)</span><input class="control-input" id="add-agent-peers" placeholder="editor, reviewer"></div>
+            <div class="control-group"><span class="control-label">Soul (optional)</span><textarea class="control-textarea" id="add-agent-soul" placeholder="Leave blank for default"></textarea></div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideModal('modal-add-agent')">Cancel</button>
+            <button class="btn" onclick="doAddAgent()">Create</button>
+        </div>
+    </div>
+</div>
 
+<!-- Add Team Modal -->
+<div class="modal-bg" id="modal-add-team">
+    <div class="modal">
+        <div class="modal-header">Create Team</div>
+        <div class="modal-body">
+            <div class="control-group"><span class="control-label">Team ID (slug)</span><input class="control-input" id="add-team-id" placeholder="e.g., alpha"></div>
+            <div class="control-group"><span class="control-label">Team Name</span><input class="control-input" id="add-team-name" placeholder="e.g., Alpha Team"></div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideModal('modal-add-team')">Cancel</button>
+            <button class="btn" onclick="doAddTeam()">Create</button>
+        </div>
+    </div>
+</div>
+
+<!-- Link Editor Modal -->
+<div class="modal-bg" id="modal-link-editor">
+    <div class="modal">
+        <div class="modal-header">Link Editor</div>
+        <div class="modal-body" id="link-editor-body">
+            <div class="empty-state">Loading...</div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideModal('modal-link-editor')">Close</button>
+        </div>
+    </div>
+</div>
 
 <script>
 const WS_URL = `ws://${window.location.host}/ws`;
@@ -175,6 +261,8 @@ const API_URL = `${window.location.protocol}//${window.location.host}`;
 
 let ws = null, reconnectTimer = null, reconnectDelay = 1000;
 let agentData = {}, selectedAgent = null, eventCount = 0, msgCount = 0;
+let currentTeam = null;
+let teamsCache = [];
 
 function setWsStatus(status, text) {
     const el = document.getElementById('ws-status');
@@ -212,6 +300,7 @@ function handleWS(msg) {
         case 'message_logged': if (selectedAgent === payload.agent_name) { addMessageToUI(payload); } msgCount++; document.getElementById('msg-count').textContent = msgCount; break;
         case 'human_waiting': logEvent('human_waiting', `${payload.agent_name}: "${payload.question?.slice(0, 50)}..."`); break;
         case 'human_responded': logEvent('human_responded', `${payload.agent_name} received response`); break;
+        case 'link_violation': logEvent('link_violation', `${payload.from_agent} → ${payload.to_agent} denied (${payload.reason})`); break;
         case 'error': logEvent('error', `${payload.agent_name}: ${payload.error?.slice(0, 100)}`); break;
         case 'soul_updated': logEvent('system', `${payload.agent_name} soul updated`); break;
     }
@@ -221,12 +310,21 @@ function handleWS(msg) {
 function renderAgents() {
     const names = Object.keys(agentData).sort();
     const el = document.getElementById('agent-list');
-    if (!names.length) { el.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔍</div><div>Waiting...</div></div>'; return; }
+    if (!names.length) { el.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔍</div><div>No agents in this team</div></div>'; return; }
     el.innerHTML = names.map(n => {
         const a = agentData[n]; const st = a.state || 'idle'; const sel = selectedAgent === n;
+        const peers = a.config?.allowed_peers || [];
+        const peerTags = peers.length
+            ? peers.map(p => `<span class="peer-tag">${esc(p)}</span>`).join(' ')
+            : '<span class="peer-tag empty">no links</span>';
         return `<div class="agent-card ${st} ${sel?'selected':''}" onclick="selectAgent('${n}')">
             <div class="agent-name"><span class="status-dot ${st}"></span>${esc(a.config?.name || n)}</div>
             <div class="agent-meta"><span>Queue: <span class="queue-badge">${a.pending_count || 0}</span></span><span style="font-family:var(--font-mono);font-size:10px">${a.config?.session_id?.slice(0,14)}...</span></div>
+            <div class="agent-meta" style="margin-top:4px">${peerTags}</div>
+            <div class="agent-actions">
+                <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation();showLinkEditorFor('${n}')">🔗</button>
+                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeAgent('${n}')">×</button>
+            </div>
         </div>`;
     }).join('');
 }
@@ -234,12 +332,23 @@ function renderAgents() {
 function renderNetwork() {
     const svg = document.getElementById('network-svg');
     const names = Object.keys(agentData).sort();
-    if (!names.length) return;
+    if (!names.length) { svg.innerHTML = ''; document.getElementById('net-info').textContent = 'No agents'; return; }
     const w = 580, h = 300, cx = w/2, cy = h/2, r = Math.min(w,h)/2 - 50;
     const pos = {};
     names.forEach((n, i) => { const a = (i/names.length)*2*Math.PI - Math.PI/2; pos[n] = {x: cx+r*Math.cos(a), y: cy+r*Math.sin(a)}; });
     let html = '';
-    for (let i=0;i<names.length;i++) for(let j=i+1;j<names.length;j++) { const a=pos[names[i]], b=pos[names[j]]; html += `<line class="conn" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="#30363d" stroke-width="2"/>`; }
+    // Draw explicit links only
+    for (let i=0;i<names.length;i++) {
+        for (let j=0;j<names.length;j++) {
+            if (i === j) continue;
+            const a = names[i], b = names[j];
+            const aPeers = agentData[a]?.config?.allowed_peers || [];
+            if (aPeers.includes(b)) {
+                const pa = pos[a], pb = pos[b];
+                html += `<line class="conn" x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" stroke="#30363d" stroke-width="1.5" data-from="${a}" data-to="${b}"/>`;
+            }
+        }
+    }
     names.forEach(n => {
         const p = pos[n], st = agentData[n]?.state || 'idle';
         const col = st==='idle'?'#3fb950':st==='busy'?'#f59e0b':'#58a6ff';
@@ -254,13 +363,10 @@ function renderNetwork() {
 
 function animateParticle(fromAgent, toAgent) {
     const svg = document.getElementById('network-svg');
-    const nodes = Array.from(svg.querySelectorAll('g'));
-    const fromG = nodes.find(g => g.getAttribute('onclick')?.includes(`'${fromAgent}'`));
-    const toG = nodes.find(g => g.getAttribute('onclick')?.includes(`'${toAgent}'`));
-    if (!fromG || !toG) return;
-    const c1 = fromG.querySelector('circle'), c2 = toG.querySelector('circle');
-    const x1 = +c1.getAttribute('cx'), y1 = +c1.getAttribute('cy');
-    const x2 = +c2.getAttribute('cx'), y2 = +c2.getAttribute('cy');
+    const line = svg.querySelector(`line[data-from="${fromAgent}"][data-to="${toAgent}"]`);
+    if (!line) return; // no link = no particle
+    const x1 = +line.getAttribute('x1'), y1 = +line.getAttribute('y1');
+    const x2 = +line.getAttribute('x2'), y2 = +line.getAttribute('y2');
     const p = document.createElementNS('http://www.w3.org/2000/svg','circle');
     p.setAttribute('r','4'); p.setAttribute('fill','#58a6ff'); p.setAttribute('filter','drop-shadow(0 0 4px #58a6ff)');
     svg.appendChild(p);
@@ -271,12 +377,8 @@ function animateParticle(fromAgent, toAgent) {
         if (k<1) requestAnimationFrame(step); else p.remove();
     }
     requestAnimationFrame(step);
-    svg.querySelectorAll('line').forEach(line => {
-        const lx1=+line.getAttribute('x1'), ly1=+line.getAttribute('y1'), lx2=+line.getAttribute('x2'), ly2=+line.getAttribute('y2');
-        if ((Math.abs(lx1-x1)<2&&Math.abs(ly1-y1)<2&&Math.abs(lx2-x2)<2&&Math.abs(ly2-y2)<2) || (Math.abs(lx1-x2)<2&&Math.abs(ly1-y2)<2&&Math.abs(lx2-x1)<2&&Math.abs(ly2-y1)<2)) {
-            line.setAttribute('stroke','#58a6ff'); setTimeout(() => line.setAttribute('stroke','#30363d'), 800);
-        }
-    });
+    line.setAttribute('stroke','#58a6ff'); line.setAttribute('stroke-width','2.5');
+    setTimeout(() => { line.setAttribute('stroke','#30363d'); line.setAttribute('stroke-width','1.5'); }, 800);
 }
 
 function renderQueues() {
@@ -321,7 +423,6 @@ function addMessageToUI(msg) {
 
 function formatMessageContent(msg) {
     let text = esc(msg.content || '');
-    // If it looks like a tool result or tool call, format it nicely
     if (text.startsWith('🛠️ Tool Calls:') || text.startsWith('📤 Tool Result')) {
         return `<pre>${text}</pre>`;
     }
@@ -379,7 +480,7 @@ function logEvent(type, message) {
     const time = new Date().toLocaleTimeString([], {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
     const line = document.createElement('div');
     line.className = `event-line ${type}`;
-    line.innerHTML = `<span class="ev-time">${time}</span><span class="ev-tag" style="color:var(--${type==='state_change'?'accent':type==='task_enqueued'?'idle':type==='message_sent'?'busy':type==='error'?'danger':type==='human_waiting'?'human':'text-muted'})">${type}</span><span class="ev-desc">${esc(message)}</span>`;
+    line.innerHTML = `<span class="ev-time">${time}</span><span class="ev-tag" style="color:var(--${type==='state_change'?'accent':type==='task_enqueued'?'idle':type==='message_sent'?'busy':type==='error'?'danger':type==='human_waiting'?'human':type==='link_violation'?'danger':'text-muted'})">${type}</span><span class="ev-desc">${esc(message)}</span>`;
     container.insertBefore(line, container.firstChild);
     while (container.children.length > 150) container.removeChild(container.lastChild);
     updateStats();
@@ -404,13 +505,35 @@ function selectAgent(name) {
 }
 
 function updateTarget() {
-    const s = document.getElementById('ctrl-target');
-    s.innerHTML = Object.keys(agentData).sort().map(n => `<option value="${n}">${n}</option>`).join('');
+    const src = document.getElementById('ctrl-source').value;
+    const tgt = document.getElementById('ctrl-target');
+    const names = Object.keys(agentData).sort();
+    // Populate source
+    const srcSel = document.getElementById('ctrl-source');
+    if (!srcSel.children.length) {
+        srcSel.innerHTML = names.map(n => `<option value="${n}">${esc(agentData[n]?.config?.name || n)}</option>`).join('');
+    }
+    // Populate target: only linked agents of the source
+    const sourceName = srcSel.value;
+    const peers = agentData[sourceName]?.config?.allowed_peers || [];
+    tgt.innerHTML = '';
+    if (!peers.length) {
+        tgt.innerHTML = '<option value="">No linked agents</option>';
+        return;
+    }
+    peers.forEach(p => {
+        if (agentData[p]) {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.textContent = agentData[p]?.config?.name || p;
+            tgt.appendChild(opt);
+        }
+    });
 }
 
 async function refreshData() {
     try {
-        const res = await fetch(`${API_URL}/monitoring/agents`);
+        const res = await fetch(`${API_URL}/monitoring/agents${currentTeam ? '?team_id='+currentTeam : ''}`);
         const data = await res.json();
         if (data.agents) { Object.assign(agentData, data.agents); renderAgents(); renderNetwork(); renderQueues(); updateStats(); updateTarget(); updateSweepTimer(); }
     } catch (e) { console.error(e); }
@@ -449,11 +572,132 @@ function updateSweepTimer() {
     if (!isFinite(next)) { el.textContent = 'Next sweep in ?s'; return; }
     const remaining = Math.max(0, Math.round(next - Date.now() / 1000));
     el.textContent = `Next sweep in ${remaining}s`;
-    renderQueues(); // refresh per-agent timers
+    renderQueues();
 }
 setInterval(updateSweepTimer, 500);
 
-document.addEventListener('DOMContentLoaded', () => { connectWS(); refreshData(); });
+/* ===== TEAM MANAGEMENT ===== */
+async function loadTeams() {
+    try {
+        const res = await fetch(`${API_URL}/teams`);
+        const data = await res.json();
+        const sel = document.getElementById('team-select');
+        teamsCache = data.teams || [];
+        sel.innerHTML = teamsCache.map(t => `<option value="${t.id}">${esc(t.name)} (${t.agent_count})</option>`).join('');
+        if (!currentTeam && teamsCache.length) {
+            currentTeam = teamsCache[0].id;
+            sel.value = currentTeam;
+        }
+        refreshData();
+    } catch (e) { console.error(e); }
+}
+
+function changeTeam(teamId) {
+    currentTeam = teamId;
+    selectedAgent = null;
+    agentData = {};
+    refreshData();
+}
+
+function showAddTeam() { document.getElementById('modal-add-team').classList.add('show'); }
+function showAddAgent() { document.getElementById('modal-add-agent').classList.add('show'); }
+function hideModal(id) { document.getElementById(id).classList.remove('show'); }
+
+async function doAddTeam() {
+    const id = document.getElementById('add-team-id').value.trim();
+    const name = document.getElementById('add-team-name').value.trim();
+    if (!id || !name) return;
+    try {
+        const res = await fetch(`${API_URL}/teams`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({team_id: id, name}) });
+        const data = await res.json();
+        if (data.error) { logEvent('error', data.error); return; }
+        logEvent('system', `Team created: ${id}`);
+        hideModal('modal-add-team');
+        loadTeams();
+    } catch (e) { logEvent('error', e.message); }
+}
+
+async function doAddAgent() {
+    const id = document.getElementById('add-agent-id').value.trim();
+    const name = document.getElementById('add-agent-name').value.trim();
+    const peersRaw = document.getElementById('add-agent-peers').value.trim();
+    const soul = document.getElementById('add-agent-soul').value.trim();
+    const peers = peersRaw ? peersRaw.split(',').map(p => p.trim()).filter(Boolean) : [];
+    if (!id || !name || !currentTeam) return;
+    try {
+        const res = await fetch(`${API_URL}/agent`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({agent_name: id, name, team_id: currentTeam, allowed_peers: peers, soul: soul || undefined}) });
+        const data = await res.json();
+        if (data.error) { logEvent('error', data.error); return; }
+        logEvent('system', `Agent created: ${id}`);
+        hideModal('modal-add-agent');
+        document.getElementById('add-agent-id').value = '';
+        document.getElementById('add-agent-name').value = '';
+        document.getElementById('add-agent-peers').value = '';
+        document.getElementById('add-agent-soul').value = '';
+        refreshData();
+        loadTeams();
+    } catch (e) { logEvent('error', e.message); }
+}
+
+async function removeAgent(name) {
+    if (!confirm(`Permanently delete agent "${name}"? All data will be lost.`)) return;
+    try {
+        const res = await fetch(`${API_URL}/agent/${name}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.error) { logEvent('error', data.error); return; }
+        logEvent('system', `Agent deleted: ${name}`);
+        if (selectedAgent === name) selectedAgent = null;
+        delete agentData[name];
+        renderAgents(); renderNetwork(); renderQueues(); updateTarget();
+        loadTeams();
+    } catch (e) { logEvent('error', e.message); }
+}
+
+/* ===== LINK EDITOR ===== */
+function showLinkEditor() { renderLinkEditor(); document.getElementById('modal-link-editor').classList.add('show'); }
+function showLinkEditorFor(agentName) { renderLinkEditor(agentName); document.getElementById('modal-link-editor').classList.add('show'); }
+
+function renderLinkEditor(preselectAgent) {
+    const names = Object.keys(agentData).sort();
+    const body = document.getElementById('link-editor-body');
+    if (names.length < 2) { body.innerHTML = '<div class="empty-state">Need at least 2 agents to create links</div>'; return; }
+
+    const selectOpts = names.map(n => `<option value="${n}">${esc(agentData[n]?.config?.name || n)}</option>`).join('');
+    let html = '<div style="margin-bottom:12px;font-size:12px;color:var(--text-muted)">Click a peer tag to toggle the link.</div>';
+
+    names.forEach(n => {
+        const peers = agentData[n]?.config?.allowed_peers || [];
+        html += `<div style="margin-bottom:10px"><strong style="font-size:12px">${esc(agentData[n]?.config?.name || n)}</strong> → `;
+        names.forEach(other => {
+            if (other === n) return;
+            const linked = peers.includes(other);
+            html += `<button class="btn btn-sm ${linked ? '' : 'btn-secondary'}" style="margin:2px" onclick="toggleLink('${n}','${other}')">${esc(other)} ${linked ? '✓' : '○'}</button>`;
+        });
+        html += '</div>';
+    });
+    body.innerHTML = html;
+}
+
+async function toggleLink(from, to) {
+    const currentlyLinked = (agentData[from]?.config?.allowed_peers || []).includes(to);
+    try {
+        if (currentlyLinked) {
+            const res = await fetch(`${API_URL}/agent/${from}/peers/${to}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (data.error) { logEvent('error', data.error); return; }
+        } else {
+            const res = await fetch(`${API_URL}/agent/${from}/peers`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({peers: [...(agentData[from]?.config?.allowed_peers || []), to]}) });
+            const data = await res.json();
+            if (data.error) { logEvent('error', data.error); return; }
+        }
+        // Refresh config
+        refreshData().then(() => renderLinkEditor());
+        logEvent('system', `${from} ${currentlyLinked ? 'unlinked' : 'linked'} to ${to}`);
+    } catch (e) { logEvent('error', e.message); }
+}
+
+/* ===== INIT ===== */
+document.addEventListener('DOMContentLoaded', () => { connectWS(); loadTeams(); });
 </script>
 </body>
 </html>

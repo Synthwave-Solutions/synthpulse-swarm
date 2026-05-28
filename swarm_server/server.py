@@ -18,9 +18,20 @@ from swarm_server.config import (
     MONITORING_DB,
     SERVER_HOST,
     SERVER_PORT,
-    WORKSPACE_ROOT,
+    add_agent_peer,
+    create_agent,
+    create_team,
+    delete_agent,
+    delete_team,
+    get_agent_team,
+    get_team_agents,
+    list_teams,
     load_agents_config,
+    remove_agent_peer,
     save_agent_config,
+    save_all_config,
+    set_agent_peers,
+    _derive_workspace_path,
 )
 from swarm_server.monitoring import monitor_db
 from swarm_server.tools import _daemon_registry
@@ -31,7 +42,7 @@ log = logging.getLogger("swarm.server")
 # ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Hermes Swarm Server", version="0.3.0")
+app = FastAPI(title="Hermes Swarm Server", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -135,24 +146,215 @@ async def human_response(agent_name: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Team Routes
+# ---------------------------------------------------------------------------
+@app.get("/teams")
+async def get_teams():
+    cfg = load_agents_config()
+    return JSONResponse({"teams": list_teams(cfg)})
+
+
+@app.post("/teams")
+async def post_team(request: Request):
+    body = await request.json()
+    team_id = body.get("team_id", "").strip()
+    name = body.get("name", "").strip()
+    if not team_id or not name:
+        return JSONResponse({"error": "team_id and name required"}, status_code=400)
+    cfg = load_agents_config()
+    try:
+        team = create_team(cfg, team_id, name)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    return JSONResponse({"status": "created", "team": team})
+
+
+@app.delete("/teams/{team_id}")
+async def del_team(team_id: str):
+    cfg = load_agents_config()
+    # Stop all daemons in this team before deleting
+    agents_in_team = [n for n, a in cfg["agents"].items() if a.get("team_id") == team_id]
+    for name in agents_in_team:
+        _stop_and_unregister_daemon(name)
+    if delete_team(cfg, team_id):
+        return JSONResponse({"status": "deleted", "team_id": team_id})
+    return JSONResponse({"error": "team not found"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Agent Management Routes
+# ---------------------------------------------------------------------------
+@app.get("/agents")
+async def get_agents(team_id: str = None):
+    cfg = load_agents_config()
+    agents = cfg["agents"]
+    if team_id:
+        agents = {n: a for n, a in agents.items() if a.get("team_id") == team_id}
+    return JSONResponse({"agents": agents, "teams": cfg["teams"]})
+
+
+@app.post("/agent")
+async def add_agent(request: Request):
+    body = await request.json()
+    agent_name = body.get("agent_name", "").strip()
+    display_name = body.get("name", "").strip()
+    team_id = body.get("team_id", "").strip()
+    allowed_peers = body.get("allowed_peers", [])
+    soul = body.get("soul")
+
+    if not agent_name or not display_name or not team_id:
+        return JSONResponse(
+            {"error": "agent_name, name (display), and team_id are required"},
+            status_code=400,
+        )
+
+    cfg = load_agents_config()
+    if team_id not in cfg["teams"]:
+        return JSONResponse({"error": f"Team '{team_id}' not found"}, status_code=404)
+
+    try:
+        agent_cfg = create_agent(
+            cfg,
+            name=agent_name,
+            team_id=team_id,
+            display_name=display_name,
+            allowed_peers=allowed_peers,
+            soul=soul,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+
+    if agent_name not in daemons:
+        loop = asyncio.get_running_loop()
+        register_agent_daemon(agent_name, agent_cfg, loop)
+
+    return JSONResponse({
+        "status": "created",
+        "agent_name": agent_name,
+        "team_id": team_id,
+    })
+
+
+@app.delete("/agent/{agent_name}")
+async def remove_agent(agent_name: str):
+    cfg = load_agents_config()
+    if agent_name not in cfg["agents"]:
+        return JSONResponse({"error": "agent not found"}, status_code=404)
+
+    _stop_and_unregister_daemon(agent_name)
+    delete_agent(cfg, agent_name)
+    return JSONResponse({"status": "deleted", "agent_name": agent_name})
+
+
+def _update_daemon_cfg(agent_name: str, new_cfg: Dict[str, Any]):
+    daemon = daemons.get(agent_name)
+    if daemon is not None:
+        with daemon._lock:
+            daemon.cfg = new_cfg
+
+
+@app.get("/agent/{agent_name}/peers")
+async def get_agent_peers(agent_name: str):
+    cfg = load_agents_config()
+    if agent_name not in cfg["agents"]:
+        return JSONResponse({"error": "agent not found"}, status_code=404)
+    return JSONResponse({
+        "agent_name": agent_name,
+        "allowed_peers": cfg["agents"][agent_name].get("allowed_peers", []),
+    })
+
+
+@app.post("/agent/{agent_name}/peers")
+async def add_peers(agent_name: str, request: Request):
+    body = await request.json()
+    peers = body.get("peers", [])
+    if not isinstance(peers, list):
+        return JSONResponse({"error": "peers must be a list"}, status_code=400)
+
+    cfg = load_agents_config()
+    if agent_name not in cfg["agents"]:
+        return JSONResponse({"error": "agent not found"}, status_code=404)
+
+    set_agent_peers(cfg, agent_name, peers)
+    _update_daemon_cfg(agent_name, cfg["agents"][agent_name])
+    return JSONResponse({
+        "status": "updated",
+        "agent_name": agent_name,
+        "allowed_peers": peers,
+    })
+
+
+@app.delete("/agent/{agent_name}/peers/{peer_name}")
+async def del_peer(agent_name: str, peer_name: str):
+    cfg = load_agents_config()
+    if agent_name not in cfg["agents"]:
+        return JSONResponse({"error": "agent not found"}, status_code=404)
+    remove_agent_peer(cfg, agent_name, peer_name)
+
+    # Also remove the reverse link if it exists
+    if peer_name in cfg["agents"] and agent_name in cfg["agents"][peer_name].get("allowed_peers", []):
+        remove_agent_peer(cfg, peer_name, agent_name)
+        if peer_name in daemons:
+            _update_daemon_cfg(peer_name, cfg["agents"][peer_name])
+
+    _update_daemon_cfg(agent_name, cfg["agents"][agent_name])
+    return JSONResponse({
+        "status": "removed",
+        "agent_name": agent_name,
+        "removed_peer": peer_name,
+    })
+
+
+@app.post("/agent/{agent_name}/soul")
+async def update_agent_soul(agent_name: str, request: Request):
+    body = await request.json()
+    soul = body.get("soul")
+    if not soul:
+        return JSONResponse({"error": "Missing 'soul' field"}, status_code=400)
+
+    cfg = load_agents_config()
+    if agent_name not in cfg["agents"]:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+
+    cfg["agents"][agent_name]["soul"] = soul
+    save_agent_config(agent_name, cfg["agents"][agent_name])
+
+    if agent_name in daemons:
+        daemon = daemons[agent_name]
+        with daemon._lock:
+            daemon.cfg = cfg["agents"][agent_name]
+            daemon._ai_agent = None
+        log.info("[Dynamic Registry] Soul updated for agent '%s'", agent_name)
+
+    from swarm_server.websocket import _broadcast
+
+    _broadcast("soul_updated", {"agent_name": agent_name, "timestamp": __import__("time").time()})
+    return JSONResponse({"status": "success", "message": f"Soul for '{agent_name}' updated."})
+
+
+# ---------------------------------------------------------------------------
 # Monitoring Routes
 # ---------------------------------------------------------------------------
 @app.get("/monitoring/agents")
-async def monitoring_agents():
+async def monitoring_agents(team_id: str = None):
     import time
 
+    cfg = load_agents_config()
+    result = {}
+    for name, d in daemons.items():
+        if team_id and d.cfg.get("team_id") != team_id:
+            continue
+        result[name] = {
+            "state": d.state,
+            "pending_count": d.queue.get_pending_count(),
+            "next_sweep_at": d.next_sweep_at,
+            "team_id": d.cfg.get("team_id"),
+            "session_id": d.cfg.get("session_id"),
+            "soul_preview": d.cfg.get("soul", "")[:200],
+            "allowed_peers": d.cfg.get("allowed_peers", []),
+        }
     return JSONResponse({
-        "agents": {
-            name: {
-                "state": d.state,
-                "pending_count": d.queue.get_pending_count(),
-                "next_sweep_at": d.next_sweep_at,
-                "workspace": d.cfg.get("workspace"),
-                "session_id": d.cfg.get("session_id"),
-                "soul_preview": d.cfg.get("soul", "")[:200],
-            }
-            for name, d in daemons.items()
-        },
+        "agents": result,
         "timestamp": time.time(),
     })
 
@@ -184,11 +386,13 @@ async def monitoring_queue(agent_name: str):
 
 
 @app.get("/monitoring/stats")
-async def monitoring_stats():
+async def monitoring_stats(team_id: str = None):
     import time
 
-    stats = monitor_db.get_agent_stats()
+    stats = monitor_db.get_agent_stats(team_id=team_id)
     for name, daemon in daemons.items():
+        if team_id and daemon.cfg.get("team_id") != team_id:
+            continue
         if name not in stats:
             stats[name] = {"events": {}, "total_messages": 0}
         stats[name]["current_state"] = daemon.state
@@ -203,80 +407,16 @@ async def monitoring_recent(limit: int = 100):
 
 
 # ---------------------------------------------------------------------------
-# Agent Management Routes
+# Health
 # ---------------------------------------------------------------------------
-@app.get("/agents")
-async def get_agents():
-    return JSONResponse(load_agents_config())
-
-
-@app.post("/agent")
-async def add_or_update_agent(request: Request):
-    body = await request.json()
-    agent_name = body.get("agent_name")
-    name = body.get("name")
-    session_id = body.get("session_id")
-    workspace = body.get("workspace")
-    port = body.get("port")
-    peer_name = body.get("peer_name")
-    peer_port = body.get("peer_port")
-    soul = body.get("soul")
-
-    if not agent_name or not name or not session_id or not workspace or not soul:
-        return JSONResponse({"error": "Missing required fields"}, status_code=400)
-
-    cfg = {
-        "name": name,
-        "session_id": session_id,
-        "workspace": workspace,
-        "port": port,
-        "peer_name": peer_name,
-        "peer_port": peer_port,
-        "soul": soul,
-    }
-    save_agent_config(agent_name, cfg)
-    loop = asyncio.get_running_loop()
-    if agent_name in daemons:
-        daemon = daemons[agent_name]
-        with daemon._lock:
-            daemon.cfg = cfg
-            daemon._ai_agent = None
-    else:
-        register_agent_daemon(agent_name, cfg, loop)
-    return JSONResponse({"status": "success", "message": f"Agent '{agent_name}' registered/updated."})
-
-
-@app.post("/agent/{agent_name}/soul")
-async def update_agent_soul(agent_name: str, request: Request):
-    body = await request.json()
-    soul = body.get("soul")
-    if not soul:
-        return JSONResponse({"error": "Missing 'soul' field"}, status_code=400)
-
-    config = load_agents_config()
-    if agent_name not in config:
-        return JSONResponse({"error": "Agent not found"}, status_code=404)
-
-    cfg = config[agent_name]
-    cfg["soul"] = soul
-    save_agent_config(agent_name, cfg)
-
-    if agent_name in daemons:
-        daemon = daemons[agent_name]
-        with daemon._lock:
-            daemon.cfg = cfg
-            daemon._ai_agent = None
-        log.info("[Dynamic Registry] Soul updated for agent '%s'", agent_name)
-
-    from swarm_server.websocket import _broadcast
-
-    _broadcast("soul_updated", {"agent_name": agent_name, "timestamp": __import__("time").time()})
-    return JSONResponse({"status": "success", "message": f"Soul for '{agent_name}' updated."})
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agents": list(daemons.keys())}
+    cfg = load_agents_config()
+    return {
+        "status": "ok",
+        "agents": list(daemons.keys()),
+        "teams": list(cfg["teams"].keys()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +444,10 @@ async def on_startup():
 
     from swarm_server.websocket import _broadcast
 
-    for agent_name, cfg in AGENTS.items():
-        db_path = WORKSPACE_ROOT / cfg["workspace"] / f"{agent_name}_queue.db"
+    cfg = load_agents_config()
+    for agent_name, agent_cfg in cfg["agents"].items():
+        team_id = agent_cfg.get("team_id", "default")
+        db_path = _derive_workspace_path(team_id, agent_name) / f"{agent_name}_queue.db"
         if db_path.exists():
             try:
                 db_path.unlink()
@@ -314,8 +456,8 @@ async def on_startup():
                 log.warning("[Startup] Could not delete DB %s: %s", db_path, e)
 
     loop = asyncio.get_running_loop()
-    for agent_name, cfg in AGENTS.items():
-        register_agent_daemon(agent_name, cfg, loop)
+    for agent_name, agent_cfg in cfg["agents"].items():
+        register_agent_daemon(agent_name, agent_cfg, loop)
 
     log.info("[Startup] All agents running. LiteLLM at %s", LITELLM_API_BASE)
     log.info("[Startup] Dashboard at http://%s:%s/", SERVER_HOST, SERVER_PORT)
@@ -323,9 +465,8 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    for daemon in daemons.values():
-        if daemon._sweep_task:
-            daemon._sweep_task.cancel()
+    for name, daemon in list(daemons.items()):
+        _stop_daemon(daemon)
     log.info("[Shutdown] All sweep tasks cancelled")
 
 
@@ -338,3 +479,19 @@ def register_agent_daemon(agent_name: str, cfg: Dict[str, Any], loop: asyncio.Ab
     _daemon_registry[agent_name] = daemon
     daemon.start_sweep(loop)
     log.info("[Dynamic Registry] Registered agent '%s' daemon", agent_name)
+
+
+def _stop_daemon(daemon: AgentDaemon):
+    if daemon._sweep_task and not daemon._sweep_task.done():
+        daemon._sweep_task.cancel()
+        log.info("[Daemon] Cancelled sweep for '%s'", daemon.name)
+
+
+def _stop_and_unregister_daemon(agent_name: str):
+    daemon = daemons.get(agent_name)
+    if daemon is None:
+        return
+    _stop_daemon(daemon)
+    daemons.pop(agent_name, None)
+    _daemon_registry.pop(agent_name, None)
+    log.info("[Daemon] Unregistered '%s'", agent_name)

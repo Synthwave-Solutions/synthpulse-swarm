@@ -9,7 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from swarm_server.config import LITELLM_API_BASE, SWEEP_INTERVAL_SECONDS, WORKSPACE_ROOT
+from swarm_server.config import (
+    LITELLM_API_BASE,
+    SWEEP_INTERVAL_SECONDS,
+    _derive_workspace_path,
+)
 from swarm_server.monitoring import monitor_db
 from swarm_server.queue import TaskQueue
 from swarm_server.tools import (
@@ -33,7 +37,7 @@ class AgentDaemon:
         self.state = AGENT_STATE_IDLE
         self._lock = threading.Lock()
 
-        workspace_dir = WORKSPACE_ROOT / cfg["workspace"]
+        workspace_dir = _derive_workspace_path(cfg.get("team_id", "default"), name)
         workspace_dir.mkdir(parents=True, exist_ok=True)
         db_path = workspace_dir / f"{name}_queue.db"
         self.queue = TaskQueue(db_path)

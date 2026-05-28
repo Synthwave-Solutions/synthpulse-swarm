@@ -61,10 +61,44 @@ def _send_peer_message_handler(args: dict, **kwargs) -> str:
     if task_id_arg and task_id_arg.startswith("agent_name:"):
         caller = task_id_arg.split(":", 1)[1]
 
+    from swarm_server.config import load_agents_config, peer_allowed
+
+    cfg = load_agents_config()
+
     target = _daemon_registry.get(to_agent)
     if target is None:
         known = list(_daemon_registry.keys())
         return json.dumps({"success": False, "error": f"Unknown agent '{to_agent}'. Known: {known}"})
+
+    if not peer_allowed(cfg, caller, to_agent):
+        caller_team = cfg["agents"].get(caller, {}).get("team_id", "?")
+        target_team = cfg["agents"].get(to_agent, {}).get("team_id", "?")
+        reason = (
+            "cross-team communication" 
+            if caller_team != target_team else 
+            "not in allowed_peers"
+        )
+        log.warning(
+            "[send_peer_message] DENIED %s -> %s (%s)", caller, to_agent, reason
+        )
+        monitor_db.log_event(
+            caller, "link_violation",
+            to_agent=to_agent,
+            data={"reason": reason, "target_team": target_team},
+        )
+        _broadcast("link_violation", {
+            "from_agent": caller,
+            "to_agent": to_agent,
+            "reason": reason,
+            "timestamp": __import__("time").time(),
+        })
+        return json.dumps({
+            "success": False,
+            "error": (
+                f"Messaging to '{to_agent}' denied ({reason}). "
+                f"You are only linked to: {cfg['agents'].get(caller, {}).get('allowed_peers', [])}"
+            ),
+        })
 
     task_id = target.ingest_task(from_agent=caller, payload=message)
     log.info("[send_peer_message] %s -> %s | task_id=%s", caller, to_agent, task_id[:8])
