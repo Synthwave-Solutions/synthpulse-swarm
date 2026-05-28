@@ -214,7 +214,7 @@ body {
             <div class="control-group"><span class="control-label">Agent ID (slug)</span><input class="control-input" id="add-agent-id" placeholder="e.g., researcher_2"></div>
             <div class="control-group"><span class="control-label">Display Name</span><input class="control-input" id="add-agent-name" placeholder="e.g., Researcher Agent 2"></div>
             <div class="control-group"><span class="control-label">Allowed Peers (comma-separated)</span><input class="control-input" id="add-agent-peers" placeholder="editor, reviewer"></div>
-            <div class="control-group"><span class="control-label">Soul (optional)</span><textarea class="control-textarea" id="add-agent-soul" placeholder="Leave blank for default"></textarea></div>
+            <div class="control-group"><span class="control-label">Role Soul (your prompt)</span><textarea class="control-textarea" id="add-agent-soul" placeholder="Describe this agent's responsibilities, expertise, and behavior..."></textarea></div>
         </div>
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="hideModal('modal-add-agent')">Cancel</button>
@@ -619,11 +619,11 @@ async function doAddAgent() {
     const id = document.getElementById('add-agent-id').value.trim();
     const name = document.getElementById('add-agent-name').value.trim();
     const peersRaw = document.getElementById('add-agent-peers').value.trim();
-    const soul = document.getElementById('add-agent-soul').value.trim();
+    const role_soul = document.getElementById('add-agent-soul').value.trim();
     const peers = peersRaw ? peersRaw.split(',').map(p => p.trim()).filter(Boolean) : [];
     if (!id || !name || !currentTeam) return;
     try {
-        const res = await fetch(`${API_URL}/agent`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({agent_name: id, name, team_id: currentTeam, allowed_peers: peers, soul: soul || undefined}) });
+        const res = await fetch(`${API_URL}/agent`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({agent_name: id, name, team_id: currentTeam, allowed_peers: peers, role_soul: role_soul || undefined}) });
         const data = await res.json();
         if (data.error) { logEvent('error', data.error); return; }
         logEvent('system', `Agent created: ${id}`);

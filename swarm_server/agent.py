@@ -13,6 +13,7 @@ from swarm_server.config import (
     LITELLM_API_BASE,
     SWEEP_INTERVAL_SECONDS,
     _derive_workspace_path,
+    compose_agent_soul,
 )
 from swarm_server.monitoring import monitor_db
 from swarm_server.queue import TaskQueue
@@ -73,7 +74,7 @@ class AgentDaemon:
                     skip_memory=False,
                     skip_context_files=False,
                     quiet_mode=True,
-                    ephemeral_system_prompt=self.cfg["soul"],
+                    ephemeral_system_prompt=compose_agent_soul(self.cfg),
                 )
                 _register_custom_tools()
 

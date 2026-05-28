@@ -29,16 +29,44 @@ LITELLM_API_BASE = f"http://{SERVER_HOST}:4000/v1"
 SWEEP_INTERVAL_SECONDS = 10
 
 # ---------------------------------------------------------------------------
-# Agent defaults
+# Common SOUL — shared by all agents in the framework
+# Injected at runtime with: {agent_name}, {team_id}, {allowed_peers_list}
 # ---------------------------------------------------------------------------
-DEFAULT_SOUL_TEMPLATE = (
-    "You are the {agent_display_name}.\n"
-    "You operate autonomously. Process tasks with your available tools without asking for permission.\n"
-    "Only call 'ask_human' when you are genuinely stuck, the instructions are ambiguous, "
-    "or a task explicitly requires human judgment (e.g., approvals, subjective choices).\n"
-    "To send a message, task, result, or response to another agent, "
-    "use the 'send_peer_message' tool.\n"
-    "After calling 'send_peer_message' or 'ask_human', stop calling tools and end your turn."
+COMMON_SOUL_TEMPLATE = (
+    "You are an autonomous agent in a multi-agent swarm.\n"
+    "You operate within an async system: tasks arrive in batches and are processed "
+    "every ~{sweep_interval}s. Responses are not immediate.\n\n"
+    "--- SWARM RULES ---\n"
+    "1. NEVER end your turn silently. Always conclude by calling a tool.\n"
+    "   - Use 'send_peer_message' to send results, delegate tasks, or chat with peers.\n"
+    "   - Use 'ask_human' only when genuinely stuck, instructions are ambiguous, "
+    "     or a task requires human judgment (approvals, subjective choices).\n"
+    "2. After calling 'send_peer_message' or 'ask_human', STOP calling tools and end your turn.\n"
+    "3. Process tasks autonomously without asking for permission.\n"
+    "4. Report completions, blockers, or delegation decisions back to the sender.\n"
+    "5. Keep responses concise — other agents read them in batch.\n\n"
+    "--- COMMUNICATION PROTOCOL ---\n"
+    "Use these formats when messaging peers:\n"
+    "  TASK: [description] | DELEGATE TO: [peer] — assign a task to a peer\n"
+    "  STATUS: [what you did] | BLOCKERS: [any] — progress update\n"
+    "  RESULT: [output] | NEXT: [recommended action] — deliverable complete\n"
+    "  HELP: [what you need] | CONTEXT: [background] — request assistance\n\n"
+    "--- PEERS ---\n"
+    "Your agent name: {agent_name}\n"
+    "Your team: {team_id}\n"
+    "Peers you are linked to: {allowed_peers_list}\n"
+    "You may ONLY send messages to agents in your linked peers list.\n\n"
+    "--- TOOL GUIDANCE ---\n"
+    "You have access to the full Hermes tool suite (web search, terminal, file ops, "
+    "browser, todo, memory, code execution, etc.). Use tools relevant to the task.\n"
+    "You do NOT need permission to:\n"
+    "  - Read/write files in your workspace\n"
+    "  - Run terminal commands in your workspace\n"
+    "  - Search the web\n"
+    "  - Delegate to linked peers\n"
+    "You MUST ask a human for approval before:\n"
+    "  - Actions affecting systems outside your workspace\n"
+    "  - Irreversible operations (deleting critical files, pushing code, spending resources)\n"
 )
 
 
@@ -73,14 +101,56 @@ def _migrate_legacy_config(legacy: Dict[str, Any]) -> Dict[str, Any]:
             shutil.move(str(old_path), str(new_path))
             log.info("  Moved %s -> %s", old_path, new_path)
 
+        # v2 migration: extract role-specific part from old monolithic soul
+        old_soul = cfg.get("soul", "")
+        # If old soul looks like the old default template, extract just the identity line
+        if "You are the" in old_soul and "send_peer_message" in old_soul:
+            # Extract the first sentence as role identity
+            lines = old_soul.split('\n')
+            role_lines = []
+            for line in lines:
+                if line.startswith("You are the") or line.startswith("You are a"):
+                    role_lines.append(line)
+                elif role_lines and line.strip() and not any(x in line for x in ["send_peer_message", "ask_human", "operate autonomously"]):
+                    role_lines.append(line)
+            role_soul = '\n'.join(role_lines) if role_lines else old_soul.split('.')[0] + "."
+        else:
+            role_soul = old_soul
+
         migrated["agents"][name] = {
             "team_id": default_team_id,
             "name": cfg.get("name", name.capitalize() + " Agent"),
             "session_id": cfg.get("session_id", f"{name}-master-session-v1"),
             "allowed_peers": [],
-            "soul": cfg.get("soul", DEFAULT_SOUL_TEMPLATE.format(agent_display_name=name)),
+            "role_soul": role_soul,
         }
     return migrated
+
+
+def _migrate_v1_to_v2(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate v1 config (has 'soul' field) to v2 config (has 'role_soul' field)."""
+    migrated_any = False
+    for name, agent_cfg in cfg.get("agents", {}).items():
+        if "soul" in agent_cfg and "role_soul" not in agent_cfg:
+            old_soul = agent_cfg.pop("soul")
+            # Extract role-specific part from old monolithic soul
+            lines = old_soul.split('\n')
+            role_lines = []
+            for line in lines:
+                line_stripped = line.strip()
+                if not line_stripped:
+                    continue
+                if any(x in line_stripped for x in ["send_peer_message", "ask_human", "operate autonomously",
+                                                      "swarm rules", "communication protocol", "tool guidance",
+                                                      "You are an autonomous agent", "NEVER end your turn"]):
+                    continue
+                role_lines.append(line_stripped)
+            agent_cfg["role_soul"] = '\n'.join(role_lines) if role_lines else f"You are the {agent_cfg.get('name', name)}."
+            migrated_any = True
+    if migrated_any:
+        log.info("Migrated v1 config (soul field) -> v2 config (role_soul field)")
+        _save_full_config(cfg)
+    return cfg
 
 
 def _deep_copy_config(src: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,6 +165,34 @@ def _default_config() -> Dict[str, Any]:
         },
         "agents": {},
     }
+
+
+# ---------------------------------------------------------------------------
+# Soul composition — combines common + role-specific parts
+# ---------------------------------------------------------------------------
+def compose_agent_soul(agent_cfg: Dict[str, Any]) -> str:
+    """Build the full ephemeral system prompt for an agent."""
+    agent_name = agent_cfg.get("name", "Agent")
+    team_id = agent_cfg.get("team_id", "default")
+    peers = agent_cfg.get("allowed_peers", [])
+    peers_str = ", ".join(peers) if peers else "(none — you cannot message any peers yet)"
+
+    common = COMMON_SOUL_TEMPLATE.format(
+        agent_name=agent_name,
+        team_id=team_id,
+        allowed_peers_list=peers_str,
+        sweep_interval=SWEEP_INTERVAL_SECONDS,
+    )
+
+    role = agent_cfg.get("role_soul", f"You are the {agent_name}.")
+
+    return (
+        f"{common}\n"
+        f"{'=' * 60}\n"
+        f"YOUR ROLE\n"
+        f"{'=' * 60}\n"
+        f"{role}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +224,9 @@ def load_agents_config() -> Dict[str, Any]:
         raw["teams"] = {}
     if "agents" not in raw:
         raw["agents"] = {}
+
+    # Migrate v1 -> v2 if needed
+    raw = _migrate_v1_to_v2(raw)
     return raw
 
 
@@ -193,7 +294,7 @@ def create_agent(
     team_id: str,
     display_name: str,
     allowed_peers: Optional[List[str]] = None,
-    soul: Optional[str] = None,
+    role_soul: Optional[str] = None,
 ) -> Dict[str, Any]:
     if name in cfg["agents"]:
         raise ValueError(f"Agent '{name}' already exists")
@@ -205,7 +306,7 @@ def create_agent(
         "name": display_name,
         "session_id": f"{name}-master-session-v1",
         "allowed_peers": list(allowed_peers or []),
-        "soul": soul or DEFAULT_SOUL_TEMPLATE.format(agent_display_name=display_name),
+        "role_soul": role_soul or f"You are the {display_name}.",
     }
     cfg["agents"][name] = agent_cfg
     # Prepare workspace dirs

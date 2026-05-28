@@ -201,7 +201,7 @@ async def add_agent(request: Request):
     display_name = body.get("name", "").strip()
     team_id = body.get("team_id", "").strip()
     allowed_peers = body.get("allowed_peers", [])
-    soul = body.get("soul")
+    role_soul = body.get("role_soul") or body.get("soul")  # accept both for backward compat
 
     if not agent_name or not display_name or not team_id:
         return JSONResponse(
@@ -220,7 +220,7 @@ async def add_agent(request: Request):
             team_id=team_id,
             display_name=display_name,
             allowed_peers=allowed_peers,
-            soul=soul,
+            role_soul=role_soul,
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
@@ -309,15 +309,15 @@ async def del_peer(agent_name: str, peer_name: str):
 @app.post("/agent/{agent_name}/soul")
 async def update_agent_soul(agent_name: str, request: Request):
     body = await request.json()
-    soul = body.get("soul")
-    if not soul:
-        return JSONResponse({"error": "Missing 'soul' field"}, status_code=400)
+    role_soul = body.get("role_soul") or body.get("soul")
+    if not role_soul:
+        return JSONResponse({"error": "Missing 'role_soul' field"}, status_code=400)
 
     cfg = load_agents_config()
     if agent_name not in cfg["agents"]:
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
-    cfg["agents"][agent_name]["soul"] = soul
+    cfg["agents"][agent_name]["role_soul"] = role_soul
     save_agent_config(agent_name, cfg["agents"][agent_name])
 
     if agent_name in daemons:
@@ -325,12 +325,12 @@ async def update_agent_soul(agent_name: str, request: Request):
         with daemon._lock:
             daemon.cfg = cfg["agents"][agent_name]
             daemon._ai_agent = None
-        log.info("[Dynamic Registry] Soul updated for agent '%s'", agent_name)
+        log.info("[Dynamic Registry] Role soul updated for agent '%s'", agent_name)
 
     from swarm_server.websocket import _broadcast
 
     _broadcast("soul_updated", {"agent_name": agent_name, "timestamp": __import__("time").time()})
-    return JSONResponse({"status": "success", "message": f"Soul for '{agent_name}' updated."})
+    return JSONResponse({"status": "success", "message": f"Role soul for '{agent_name}' updated."})
 
 
 # ---------------------------------------------------------------------------
