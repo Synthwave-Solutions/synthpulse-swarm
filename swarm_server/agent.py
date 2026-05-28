@@ -101,6 +101,11 @@ class AgentDaemon:
                     self._ai_agent.tools.append(_LOG_CHANGES_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("log_changes")
 
+                # Force tool-use enforcement guidance — agents must end their turn
+                # with a tool call (send_peer_message / ask_human) rather than
+                # silently stopping with a text response.
+                self._ai_agent._tool_use_enforcement = True
+
                 # Eagerly init session DB while HERMES_HOME is locked to this agent
                 try:
                     sd = self._ai_agent._get_session_db_for_recall()
