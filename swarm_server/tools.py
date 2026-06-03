@@ -294,6 +294,104 @@ _CANCEL_WAKEUP_TOOL_SCHEMA = {
 }
 
 
+_PAUSE_AGENT_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "pause_agent",
+        "description": (
+            "SUPERVISOR EMERGENCY BRAKE. Immediately freeze one agent you watch — "
+            "interrupting its in-flight turn at the next tool boundary — when it is "
+            "doing something genuinely dangerous or irreversible (e.g. destroying "
+            "production infra, killing processes it doesn't own, deleting data, "
+            "leaking secrets, or stuck in a destructive loop). Its pending work is "
+            "PRESERVED and resumes on resume_agent. This is disruptive: a paused "
+            "agent does nothing until lifted, so use it ONLY for real emergencies "
+            "where a warning message would arrive too late — not for slow, "
+            "low-quality, or merely off-track work (message them instead). After "
+            "pausing, a human is notified to review."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Name of the agent to pause (must be one you watch).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Specific justification for the emergency stop — what "
+                        "dangerous action you observed and why it can't wait. "
+                        "Required, and recorded for the human."
+                    ),
+                },
+            },
+            "required": ["agent", "reason"],
+        },
+    },
+}
+
+_RESUME_AGENT_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "resume_agent",
+        "description": (
+            "Lift a pause you (or a human) placed on an agent, once the danger has "
+            "passed — e.g. the agent acknowledged the issue, a human approved, or "
+            "you've confirmed it's safe to continue. The agent picks up its held "
+            "queue where it left off. Only resume when you are confident the unsafe "
+            "condition is resolved."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Name of the paused agent to resume.",
+                },
+            },
+            "required": ["agent"],
+        },
+    },
+}
+
+
+# Swarm-native tools (registered on every agent AFTER Hermes init, so they
+# survive any toolset whitelist). `send_peer_message` is REQUIRED (agents end
+# their turn with it) and cannot be disabled; the rest are optional and can be
+# turned off per agent via `disabled_toolsets`. pause_agent/resume_agent are
+# registered ONLY on supervisor agents (see agent.py).
+REQUIRED_SWARM_TOOLS = ("send_peer_message",)
+_SWARM_TOOL_SCHEMAS = (
+    _SEND_PEER_MESSAGE_TOOL_SCHEMA,
+    _ASK_HUMAN_TOOL_SCHEMA,
+    _LOG_CHANGES_TOOL_SCHEMA,
+    _GET_SELF_CONFIG_TOOL_SCHEMA,
+    _REQUEST_CONFIG_CHANGE_TOOL_SCHEMA,
+    _SCHEDULE_WAKEUP_TOOL_SCHEMA,
+    _CANCEL_WAKEUP_TOOL_SCHEMA,
+    _PAUSE_AGENT_TOOL_SCHEMA,
+    _RESUME_AGENT_TOOL_SCHEMA,
+)
+
+
+def list_swarm_tools():
+    """The swarm's own tools (not Hermes toolsets) as [{name, description, required}]
+    for the dashboard's enabled/disabled-toolsets picker."""
+    out = []
+    for s in _SWARM_TOOL_SCHEMAS:
+        fn = (s or {}).get("function", {}) if isinstance(s, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "description": str(fn.get("description") or "")[:160],
+            "required": name in REQUIRED_SWARM_TOOLS,
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tool Handlers
 # ---------------------------------------------------------------------------
@@ -667,6 +765,101 @@ def _cancel_wakeup_handler(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+def _pause_agent_handler(args: dict, **kwargs) -> str:
+    target_name = (args.get("agent") or args.get("agent_name") or "").strip()
+    reason = (args.get("reason") or "").strip()
+    task_id_arg = kwargs.get("task_id", "")
+    caller = "unknown"
+    if task_id_arg and task_id_arg.startswith("agent_name:"):
+        caller = task_id_arg.split(":", 1)[1]
+
+    from swarm_server.config import load_agents_config
+    cfg = load_agents_config()
+
+    # Gate 1: only a supervisor may wield the brake.
+    if not cfg["agents"].get(caller, {}).get("is_supervisor"):
+        return json.dumps({"success": False, "error": "Only a supervisor agent can pause another agent."})
+    # Gate 2: a real justification is mandatory (deters casual use).
+    if len(reason) < 10:
+        return json.dumps({"success": False, "error": "A specific reason (>=10 chars) is required — pausing is disruptive; justify the emergency."})
+    if not target_name:
+        return json.dumps({"success": False, "error": "Missing 'agent' (who to pause)."})
+    if target_name == caller:
+        return json.dumps({"success": False, "error": "Refusing to pause yourself."})
+    # Gate 3: only peers the supervisor actually watches.
+    watch = cfg["agents"].get(caller, {}).get("allowed_peers", []) or []
+    if target_name not in watch:
+        return json.dumps({"success": False, "error": f"'{target_name}' is not in your watch list {watch}."})
+
+    target = _daemon_registry.get(target_name)
+    if target is None:
+        return json.dumps({"success": False, "error": f"Unknown agent '{target_name}'. Known: {list(_daemon_registry.keys())}"})
+
+    try:
+        target.pause_execution(reason=reason, by=caller)
+    except Exception as e:
+        log.warning("[pause_agent] %s -> %s failed: %s", caller, target_name, e)
+        return json.dumps({"success": False, "error": f"pause failed: {e}"})
+
+    log.warning("[pause_agent] %s PAUSED %s: %s", caller, target_name, reason)
+    monitor_db.log_event(caller, "agent_paused", to_agent=target_name, data={"reason": reason})
+    _broadcast("agent_paused", {
+        "by": caller, "agent": target_name, "reason": reason, "timestamp": time.time(),
+    })
+    # Surface to the human inbox so a person knows an emergency stop happened and
+    # can review/resume — a paused agent is frozen until lifted.
+    try:
+        add_pending_question(
+            caller,
+            f"[EMERGENCY PAUSE] Supervisor '{caller}' paused '{target_name}'.\n\n"
+            f"Reason: {reason}\n\n"
+            f"'{target_name}' is frozen (its queued work is preserved). Resume it from the "
+            f"dashboard, or tell me to resume it, once it's safe.",
+        )
+    except Exception as e:
+        log.debug("[pause_agent] human notify failed: %s", e)
+
+    return json.dumps({
+        "success": True,
+        "message": (
+            f"'{target_name}' PAUSED — its in-flight turn was interrupted and its queue is held. "
+            f"A human has been notified to review. Resume it (resume_agent) only once the danger "
+            f"is resolved. Do not pause other agents unless they too are in genuine danger."
+        ),
+    })
+
+
+def _resume_agent_handler(args: dict, **kwargs) -> str:
+    target_name = (args.get("agent") or args.get("agent_name") or "").strip()
+    task_id_arg = kwargs.get("task_id", "")
+    caller = "unknown"
+    if task_id_arg and task_id_arg.startswith("agent_name:"):
+        caller = task_id_arg.split(":", 1)[1]
+
+    from swarm_server.config import load_agents_config
+    cfg = load_agents_config()
+    if not cfg["agents"].get(caller, {}).get("is_supervisor"):
+        return json.dumps({"success": False, "error": "Only a supervisor agent can resume another agent."})
+    if not target_name:
+        return json.dumps({"success": False, "error": "Missing 'agent' (who to resume)."})
+
+    target = _daemon_registry.get(target_name)
+    if target is None:
+        return json.dumps({"success": False, "error": f"Unknown agent '{target_name}'. Known: {list(_daemon_registry.keys())}"})
+    if not getattr(target, "_paused", False):
+        return json.dumps({"success": True, "message": f"'{target_name}' is not paused — nothing to do."})
+
+    try:
+        target.resume_execution(by=caller)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"resume failed: {e}"})
+
+    log.info("[resume_agent] %s RESUMED %s", caller, target_name)
+    monitor_db.log_event(caller, "agent_resumed", to_agent=target_name, data={})
+    _broadcast("agent_resumed", {"by": caller, "agent": target_name, "timestamp": time.time()})
+    return json.dumps({"success": True, "message": f"'{target_name}' resumed — it will pick up its held queue."})
+
+
 def _register_custom_tools():
     try:
         from swarm_server.config import ensure_hermes_importable
@@ -737,5 +930,23 @@ def _register_custom_tools():
                 description="Cancel one of your scheduled cron wake-ups by id.",
             )
             log.info("[cancel_wakeup] Registered")
+        if "pause_agent" not in (registry.get_tool_to_toolset_map() or {}):
+            registry.register(
+                name="pause_agent",
+                toolset="custom",
+                schema=_PAUSE_AGENT_TOOL_SCHEMA["function"],
+                handler=_pause_agent_handler,
+                description="Supervisor emergency brake: freeze a watched agent mid-turn.",
+            )
+            log.info("[pause_agent] Registered")
+        if "resume_agent" not in (registry.get_tool_to_toolset_map() or {}):
+            registry.register(
+                name="resume_agent",
+                toolset="custom",
+                schema=_RESUME_AGENT_TOOL_SCHEMA["function"],
+                handler=_resume_agent_handler,
+                description="Lift a pause on an agent once it's safe to continue.",
+            )
+            log.info("[resume_agent] Registered")
     except Exception as exc:
         log.warning("[Custom Tools] Could not register in Hermes registry: %s", exc)

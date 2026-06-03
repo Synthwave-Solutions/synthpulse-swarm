@@ -26,3 +26,6 @@ data/config_backups/
 
 # OS
 Thumbs.db
+
+# Local agent runtime state
+.claude/

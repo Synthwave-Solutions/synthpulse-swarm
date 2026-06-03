@@ -802,8 +802,9 @@ def _refresh_daemon_crons(agent_name: str):
 
 @app.get("/toolsets")
 async def get_toolsets():
-    """Available Hermes toolsets (for the allowed/disabled-tools picker)."""
-    return JSONResponse({"toolsets": list_toolsets()})
+    """Hermes toolsets + swarm-native tools (for the allowed/disabled-tools picker)."""
+    from swarm_server.tools import list_swarm_tools
+    return JSONResponse({"toolsets": list_toolsets(), "swarm_tools": list_swarm_tools()})
 
 
 @app.get("/agent/{agent_name}/cli")
@@ -988,6 +989,34 @@ async def stop_agent_execution(agent_name: str):
         return JSONResponse({"success": True, "message": f"Agent '{agent_name}' is already idle."})
     await daemon.stop_execution()
     return JSONResponse({"success": True, "message": f"Execution stopped for '{agent_name}'."})
+
+
+@app.post("/agent/{agent_name}/pause")
+async def pause_agent_execution(agent_name: str, request: Request):
+    """Emergency brake (human/dashboard). Freezes the agent mid-turn but keeps
+    its queue — resume with /resume. Distinct from /stop, which drains the queue."""
+    daemon = daemons.get(agent_name)
+    if daemon is None:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    reason = ""
+    try:
+        body = await request.json()
+        reason = (body or {}).get("reason", "")
+    except Exception:
+        pass
+    daemon.pause_execution(reason=reason or "Paused by operator", by="human")
+    return JSONResponse({"success": True, "message": f"Agent '{agent_name}' paused."})
+
+
+@app.post("/agent/{agent_name}/resume")
+async def resume_agent_execution(agent_name: str):
+    daemon = daemons.get(agent_name)
+    if daemon is None:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    if not getattr(daemon, "_paused", False):
+        return JSONResponse({"success": True, "message": f"Agent '{agent_name}' is not paused."})
+    daemon.resume_execution(by="human")
+    return JSONResponse({"success": True, "message": f"Agent '{agent_name}' resumed."})
 
 
 # ---------------------------------------------------------------------------

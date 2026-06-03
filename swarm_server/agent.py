@@ -49,6 +49,7 @@ log = logging.getLogger("swarm.agent")
 AGENT_STATE_IDLE = "idle"
 AGENT_STATE_BUSY = "busy"
 AGENT_STATE_ASKING_HUMAN = "asking_human"
+AGENT_STATE_PAUSED = "paused"
 
 def _ensure_hermes_on_path() -> None:
     """Make the Hermes package importable (pip install / PYTHONPATH / checkout).
@@ -137,6 +138,13 @@ class AgentDaemon:
         self.human_response = None
         self.next_sweep_at = 0.0
         self._stop_requested = False
+        # Emergency brake. When True the sweep loop processes NO work and fires no
+        # crons/heartbeat, but — unlike stop — the pending queue is PRESERVED, so
+        # the agent resumes exactly where it was. Set by a supervisor's pause_agent
+        # tool or a human via /agent/{name}/pause; cleared by resume.
+        self._paused = False
+        self._pause_reason = ""
+        self._paused_by = ""
         # Hermes reports session-CUMULATIVE token counts; we track the last
         # total so each batch can log its real delta (not just a char estimate).
         self._last_total_tokens = 0
@@ -442,15 +450,19 @@ class AgentDaemon:
                 existing_names = {
                     t.get("function", {}).get("name") for t in (self._ai_agent.tools or [])
                 }
+                # Optional swarm tools can be turned off per agent via
+                # disabled_toolsets (the dashboard picker lists them). send_peer_message
+                # is REQUIRED (turn-ending relies on it) and is never disabled.
+                disabled = set(self.cfg.get("disabled_toolsets") or [])
                 if "send_peer_message" not in existing_names:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_SEND_PEER_MESSAGE_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("send_peer_message")
-                if "ask_human" not in existing_names:
+                if "ask_human" not in existing_names and "ask_human" not in disabled:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_ASK_HUMAN_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("ask_human")
-                if "log_changes" not in existing_names:
+                if "log_changes" not in existing_names and "log_changes" not in disabled:
                     from swarm_server.tools import _LOG_CHANGES_TOOL_SCHEMA
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_LOG_CHANGES_TOOL_SCHEMA)
@@ -461,11 +473,11 @@ class AgentDaemon:
                     _GET_SELF_CONFIG_TOOL_SCHEMA,
                     _REQUEST_CONFIG_CHANGE_TOOL_SCHEMA,
                 )
-                if "get_self_config" not in existing_names:
+                if "get_self_config" not in existing_names and "get_self_config" not in disabled:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_GET_SELF_CONFIG_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("get_self_config")
-                if "request_config_change" not in existing_names:
+                if "request_config_change" not in existing_names and "request_config_change" not in disabled:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_REQUEST_CONFIG_CHANGE_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("request_config_change")
@@ -476,14 +488,30 @@ class AgentDaemon:
                     _SCHEDULE_WAKEUP_TOOL_SCHEMA,
                     _CANCEL_WAKEUP_TOOL_SCHEMA,
                 )
-                if "schedule_wakeup" not in existing_names:
+                if "schedule_wakeup" not in existing_names and "schedule_wakeup" not in disabled:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_SCHEDULE_WAKEUP_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("schedule_wakeup")
-                if "cancel_wakeup" not in existing_names:
+                if "cancel_wakeup" not in existing_names and "cancel_wakeup" not in disabled:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_CANCEL_WAKEUP_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("cancel_wakeup")
+                # Emergency brake — SUPERVISORS ONLY. pause_agent/resume_agent let
+                # the overseer freeze a peer mid-turn (e.g. about to damage prod)
+                # and lift it once safe. Never exposed to non-supervisors.
+                if self.cfg.get("is_supervisor"):
+                    from swarm_server.tools import (
+                        _PAUSE_AGENT_TOOL_SCHEMA,
+                        _RESUME_AGENT_TOOL_SCHEMA,
+                    )
+                    if "pause_agent" not in existing_names and "pause_agent" not in disabled:
+                        self._ai_agent.tools = list(self._ai_agent.tools or [])
+                        self._ai_agent.tools.append(_PAUSE_AGENT_TOOL_SCHEMA)
+                        self._ai_agent.valid_tool_names.add("pause_agent")
+                    if "resume_agent" not in existing_names and "resume_agent" not in disabled:
+                        self._ai_agent.tools = list(self._ai_agent.tools or [])
+                        self._ai_agent.tools.append(_RESUME_AGENT_TOOL_SCHEMA)
+                        self._ai_agent.valid_tool_names.add("resume_agent")
 
                 # Force tool-use enforcement guidance — agents must end their turn
                 # with a tool call (send_peer_message / ask_human) rather than
@@ -665,6 +693,82 @@ class AgentDaemon:
             "timestamp": time.time(),
         })
 
+    def pause_execution(self, reason: str = "", by: str = "") -> None:
+        """Emergency brake: interrupt any in-flight turn and freeze the agent.
+
+        Differs from stop_execution in two ways that matter for an *emergency*:
+        (1) the pending queue is PRESERVED — nothing is drained, so the held work
+        resumes intact on resume; (2) the sweep loop keeps running but processes
+        nothing (the _paused guard in _sweep), so the daemon stays alive and can
+        be un-frozen instantly. Synchronous and thread-safe: callable from a
+        supervisor's tool handler (worker thread) or a server endpoint (loop).
+        """
+        with self._lock:
+            if self._paused:
+                return
+            self._paused = True
+            self._pause_reason = (reason or "")[:500]
+            self._paused_by = by or ""
+        # Halt the in-flight Hermes turn NOW so the current (possibly dangerous)
+        # action unwinds at the next tool boundary instead of running to the end.
+        try:
+            agent = self._ai_agent
+            if agent is not None and hasattr(agent, "interrupt"):
+                agent.interrupt(f"PAUSED by {by or 'operator'}: {reason}"[:200])
+                log.info("[%s] Sent interrupt() to in-flight turn (pause)", self.name)
+        except Exception as e:
+            log.debug("[%s] pause interrupt() failed: %s", self.name, e)
+        # Release a turn parked inside ask_human so it unwinds too.
+        self.human_event.set()
+        with self._lock:
+            # Drop the cached AIAgent so the post-resume turn re-inits with a clean
+            # interrupt flag (re-init reloads history from the session DB — no loss).
+            self._ai_agent = None
+            self.state = AGENT_STATE_PAUSED
+        self._emit_state_change()
+        log.warning("[%s] PAUSED by '%s': %s", self.name, by or "operator", reason)
+        monitor_db.log_event(
+            self.name, "execution_paused", from_agent=(by or None),
+            data={"reason": reason, "by": by},
+        )
+        _broadcast("execution_paused", {
+            "agent_name": self.name,
+            "reason": reason,
+            "by": by,
+            "timestamp": time.time(),
+        })
+
+    def resume_execution(self, by: str = "") -> None:
+        """Lift a pause: re-enable processing and wake the loop immediately.
+
+        Held queue items are picked up on the next sweep. No-op if not paused.
+        """
+        with self._lock:
+            if not self._paused:
+                return
+            self._paused = False
+            prev_reason = self._pause_reason
+            self._pause_reason = ""
+            self._paused_by = ""
+            self.state = AGENT_STATE_IDLE
+        self._emit_state_change()
+        # asyncio.Event is not thread-safe — set it on the owning loop thread.
+        try:
+            if self._wake is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(self._wake.set)
+        except Exception as e:
+            log.debug("[%s] resume wake failed: %s", self.name, e)
+        log.info("[%s] RESUMED by '%s' (was paused: %s)", self.name, by or "operator", prev_reason)
+        monitor_db.log_event(
+            self.name, "execution_resumed", from_agent=(by or None),
+            data={"by": by, "was_paused_for": prev_reason},
+        )
+        _broadcast("execution_resumed", {
+            "agent_name": self.name,
+            "by": by,
+            "timestamp": time.time(),
+        })
+
     def ingest_task(self, from_agent: str, payload: str) -> str:
         task_id = self.queue.enqueue(from_agent, payload)
         log.info("[%s] Task queued from '%s': %s", self.name, from_agent, payload[:80])
@@ -719,11 +823,18 @@ class AgentDaemon:
                 pass
             self._wake.clear()
             await self._sweep()
-            self._maybe_fire_crons()
-            self._maybe_autonomous_heartbeat()
-            self._maybe_feed_supervisor()
+            # A paused agent does NOTHING off-cycle either — no crons, no
+            # autonomous heartbeat, no supervisor reviews — until resumed.
+            if not self._paused:
+                self._maybe_fire_crons()
+                self._maybe_autonomous_heartbeat()
+                self._maybe_feed_supervisor()
 
     async def _sweep(self):
+        # Frozen by an emergency pause — process nothing and leave the queue
+        # intact (work resumes untouched on resume). Return BEFORE draining.
+        if self._paused:
+            return
         # Claim a bounded batch first. If there's nothing to do, stay idle
         # SILENTLY — no state flip, no broadcast, no event. This is what keeps
         # an idle 24/7 swarm from drowning the monitoring log in busy/idle churn.
@@ -750,12 +861,15 @@ class AgentDaemon:
             # the end of real work, not from server start.
             self._last_active = time.time()
             with self._lock:
-                self.state = AGENT_STATE_IDLE
+                # If a pause landed mid-turn, the interrupted turn unwinds into
+                # here — honor the freeze instead of flipping back to idle.
+                self.state = AGENT_STATE_PAUSED if self._paused else AGENT_STATE_IDLE
                 self.next_sweep_at = time.time() + self._sweep_interval
             self._emit_state_change()
-            # More queued while we were busy? Wake immediately rather than wait.
+            # More queued while we were busy? Wake immediately rather than wait
+            # (but never while paused — held work waits for resume).
             try:
-                if self.queue.get_pending_count() > 0 and self._wake is not None:
+                if not self._paused and self.queue.get_pending_count() > 0 and self._wake is not None:
                     self._wake.set()
             except Exception:
                 pass
@@ -833,6 +947,13 @@ class AgentDaemon:
             return
         peers = self.cfg.get("allowed_peers") or []
         threshold = self._supervisor_threshold()
+        # Gather every peer with a reviewable backlog, then feed the one with the
+        # MOST unreviewed activity. Feeding the first qualifier in list order (and
+        # returning) let chatty peers early in allowed_peers permanently starve a
+        # busy/looping peer later in the list — so the agent most likely in trouble
+        # (it generates the most transcript) was the one never reviewed. Picking the
+        # largest backlog both prevents starvation and prioritizes the loudest agent.
+        candidates = []  # (tokens, peer)
         for peer in peers:
             try:
                 wm = self._sup_watermark.get(peer)
@@ -844,23 +965,30 @@ class AgentDaemon:
                     continue
                 if activity["count"] <= 0 or activity["tokens"] < threshold:
                     continue
-                msgs = monitor_db.get_messages_since(peer, wm)
-                if not msgs:
-                    continue
-                max_id = max(int(m["id"]) for m in msgs)
-                transcript = self._render_feed_transcript(msgs)
-                prompt = SUPERVISOR_FEED_PROMPT.format(
-                    peer=peer, tokens=activity["tokens"], transcript=transcript
-                )
-                self._sup_watermark[peer] = max_id
-                monitor_db.log_event(
-                    self.name, "supervisor_feed", to_agent=peer,
-                    data={"tokens": activity["tokens"], "messages": len(msgs)},
-                )
-                self.ingest_task("supervisor-feed", prompt)
-                return  # one review per tick — keep the supervisor focused
+                candidates.append((activity["tokens"], peer))
             except Exception as e:
-                log.debug("[%s] supervisor feed for %s failed: %s", self.name, peer, e)
+                log.debug("[%s] supervisor scan for %s failed: %s", self.name, peer, e)
+        if not candidates:
+            return
+        tokens, peer = max(candidates)  # highest unreviewed token backlog wins
+        try:
+            wm = self._sup_watermark.get(peer)
+            msgs = monitor_db.get_messages_since(peer, wm)
+            if not msgs:
+                return
+            max_id = max(int(m["id"]) for m in msgs)
+            transcript = self._render_feed_transcript(msgs)
+            prompt = SUPERVISOR_FEED_PROMPT.format(
+                peer=peer, tokens=tokens, transcript=transcript
+            )
+            self._sup_watermark[peer] = max_id
+            monitor_db.log_event(
+                self.name, "supervisor_feed", to_agent=peer,
+                data={"tokens": tokens, "messages": len(msgs)},
+            )
+            self.ingest_task("supervisor-feed", prompt)  # one review per tick
+        except Exception as e:
+            log.debug("[%s] supervisor feed for %s failed: %s", self.name, peer, e)
 
     def _maybe_fire_crons(self) -> None:
         """Inject the instruction of any cron wake-up whose time has come.
@@ -1010,6 +1138,29 @@ class AgentDaemon:
                 "id": str(tool_call_id), "name": str(name),
                 "result": ("" if result is None else str(result))[:2000],
             })
+            # Persist a compact step to monitoring.db AS IT HAPPENS (independent of
+            # whether a dashboard is connected). Without this, a turn's activity is
+            # invisible to digests + the supervisor until it COMPLETES — so a long
+            # runaway turn (or one that gets interrupted) evaded all oversight.
+            try:
+                try:
+                    args_s = args if isinstance(args, str) else json.dumps(args, default=str)
+                except Exception:
+                    args_s = str(args)
+                res = "" if result is None else str(result)
+                content = f"🛠️ {name}({(args_s or '')[:300]}) → {res[:600]}"
+                tids = ",".join(getattr(self, "_current_task_ids", []) or [])
+                monitor_db.log_message(self.name, "assistant", content, tids)
+                try:
+                    self._live_logged_tool_ids.add(str(tool_call_id))
+                except Exception:
+                    pass
+                _broadcast("message_logged", {
+                    "agent_name": self.name, "role": "assistant",
+                    "content": content, "task_id": tids, "timestamp": time.time(),
+                })
+            except Exception as e:
+                log.debug("[%s] live tool persist failed: %s", self.name, e)
 
         def on_stream_delta(chunk) -> None:
             # None is Hermes' flush/end sentinel — ignore it; only forward text.
@@ -1074,6 +1225,13 @@ class AgentDaemon:
     async def _process_tasks_batch(self, tasks: List[Dict[str, Any]]):
         task_ids = [t["id"] for t in tasks]
         task_preview = ", ".join([t["id"][:8] for t in tasks])
+        # Per-turn state for LIVE transcript persistence: tool steps are written
+        # to monitoring.db as they happen (see on_tool_complete) so a long or
+        # interrupted turn is visible to digests + the supervisor, which only read
+        # monitoring.db. Reset each turn; the end-of-turn logging below dedups
+        # against this set so a COMPLETED turn isn't double-written.
+        self._current_task_ids = task_ids
+        self._live_logged_tool_ids = set()
         log.info("[%s] Processing batch: %s", self.name, task_preview)
         _broadcast("conversation_start", {
             "agent_name": self.name,
@@ -1230,20 +1388,31 @@ class AgentDaemon:
                 "timestamp": time.time(),
             })
 
+            # Tool steps were persisted live this turn (on_tool_complete); when
+            # that happened, skip re-logging them here so the transcript isn't
+            # doubled. Pure-text assistant replies + the final answer still log.
+            live = bool(getattr(self, "_live_logged_tool_ids", None))
             for msg in turn_messages:
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
 
-                if role == "assistant" and msg.get("tool_calls"):
-                    tcs = msg["tool_calls"]
-                    tool_summary = " | ".join([
-                        f"{tc.get('function', {}).get('name', '?')}()" for tc in tcs
-                    ])
-                    content = f"🛠️ Tool Calls: {tool_summary}\n\n{content or ''}"
-
                 if role == "tool":
+                    if live:
+                        continue  # already persisted live as it completed
                     tc_id = msg.get("tool_call_id", "?")
                     content = f"📤 Tool Result [{tc_id}]: {content}"
+                elif role == "assistant" and msg.get("tool_calls"):
+                    if live:
+                        # The tool calls are already in the live trace; keep only
+                        # any accompanying assistant text, and drop empty ones.
+                        if not (content or "").strip():
+                            continue
+                    else:
+                        tcs = msg["tool_calls"]
+                        tool_summary = " | ".join([
+                            f"{tc.get('function', {}).get('name', '?')}()" for tc in tcs
+                        ])
+                        content = f"🛠️ Tool Calls: {tool_summary}\n\n{content or ''}"
 
                 monitor_db.log_message(self.name, role, content, ",".join(task_ids))
                 _broadcast("message_logged", {

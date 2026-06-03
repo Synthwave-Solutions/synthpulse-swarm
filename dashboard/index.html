@@ -95,6 +95,7 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
 .agent-card.idle::before { background: var(--idle); }
 .agent-card.busy::before { background: var(--busy); }
 .agent-card.asking_human::before { background: var(--human); }
+.agent-card.paused::before { background: var(--danger); }
 .card-digest { font-size: 11px; color: var(--text-secondary); margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--border); line-height: 1.4; display: flex; align-items: baseline; gap: 6px; }
 .card-digest .risk-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; position: relative; top: 1px; }
 .card-digest .dg-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -104,6 +105,7 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
 .status-dot.idle { background: var(--idle); box-shadow: 0 0 8px rgba(62,207,142,0.6); }
 .status-dot.busy { background: var(--busy); box-shadow: 0 0 8px rgba(245,181,68,0.6); animation: busy-blink 1.4s infinite; }
 .status-dot.asking_human { background: var(--human); box-shadow: 0 0 8px rgba(91,157,255,0.6); animation: busy-blink 1.8s infinite; }
+.status-dot.paused { background: var(--danger); box-shadow: 0 0 8px rgba(242,85,90,0.6); }
 @keyframes busy-blink { 0%,100%{box-shadow:0 0 0 0 rgba(245,181,68,0.5), 0 0 8px rgba(245,181,68,0.6);} 50%{box-shadow:0 0 0 6px rgba(245,181,68,0), 0 0 8px rgba(245,181,68,0.6);} }
 .agent-meta { display: flex; gap: 7px; font-size: 11px; color: var(--text-muted); margin-top: 8px; flex-wrap: wrap; align-items: center; }
 .queue-badge { background: var(--bg-input); padding: 2px 8px; border-radius: 999px; font-weight: 700; font-size: 10px; color: var(--accent-bright); border: 1px solid var(--border); }
@@ -374,13 +376,10 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
         <div class="panel-body exec-trace" id="exec-trace" style="flex:1;overflow-y:auto;display:none"><div class="empty-state"><div class="empty-state-icon">⚡</div><div>Select an agent</div></div></div>
         <div class="panel-body" id="digest-list" style="flex:1;overflow-y:auto;display:none"><div class="empty-state"><div class="empty-state-icon">🧭</div><div>Select an agent</div></div></div>
         <div class="controls-section">
-            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Send Task</div>
-            <div class="control-group">
-                <span class="control-label">Target Agent</span>
-                <select class="control-select" id="ctrl-target"></select>
+            <div style="display:flex;gap:5px">
+                <input class="control-input" id="ctrl-payload" placeholder="Message the selected agent…" style="flex:1" onkeydown="if(event.key==='Enter'){event.preventDefault();sendTask();}">
+                <button class="btn" style="width:auto;white-space:nowrap" onclick="sendTask()">Send</button>
             </div>
-            <div style="margin-bottom:6px"><textarea class="control-textarea" id="ctrl-payload" placeholder="What should this agent do?" style="min-height:60px"></textarea></div>
-            <button class="btn" onclick="sendTask()">Send</button>
             <div style="margin-top:5px;display:flex;gap:5px"><button class="btn btn-secondary" style="flex:1" onclick="refreshData()">Refresh</button><button class="btn btn-secondary" style="flex:1" onclick="clearLog()">Clear</button></div>
         </div>
     </div>
@@ -758,6 +757,9 @@ function renderAgents() {
             <div class="agent-meta" style="margin-top:4px">${peerTags}</div>
             <div class="agent-actions">
                 ${(st === 'busy' || st === 'asking_human') ? `<button class="btn btn-sm" style="background:var(--danger);border-color:var(--danger);color:white" onclick="event.stopPropagation();stopAgent('${jsAttr(n)}')">■ Stop</button>` : ''}
+                ${st === 'paused'
+                    ? `<button class="btn btn-sm" style="background:var(--idle);border-color:var(--idle);color:white" title="Lift the freeze — agent resumes its held queue" onclick="event.stopPropagation();resumeAgent('${jsAttr(n)}')">▶ Resume</button>`
+                    : `<button class="btn btn-sm btn-secondary" title="Emergency freeze — interrupts the turn but keeps the queue" onclick="event.stopPropagation();pauseAgent('${jsAttr(n)}')">⏸ Pause</button>`}
                 <button class="btn btn-sm btn-secondary" title="Configure (model, sampling, soul)" onclick="event.stopPropagation();showAgentConfig('${jsAttr(n)}')">⚙️</button>
                 <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation();showLinkEditorFor('${jsAttr(n)}')">🔗</button>
                 <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeAgent('${jsAttr(n)}')">×</button>
@@ -771,35 +773,50 @@ function renderNetwork() {
     const names = Object.keys(agentData).sort();
     if (!names.length) { svg.innerHTML = ''; document.getElementById('net-info').textContent = 'No agents'; return; }
 
-    // --- Undirected adjacency from peer links (links are bidirectional by design) ---
-    const adj = {}; names.forEach(n => adj[n] = new Set());
-    names.forEach(n => (agentData[n]?.config?.allowed_peers || []).forEach(p => {
-        if (adj[n] && adj[p]) { adj[n].add(p); adj[p].add(n); }
-    }));
-    const deg = n => adj[n] ? adj[n].size : 0;
+    const isSup = n => !!agentData[n]?.config?.is_supervisor;
+    const peersOf = n => new Set(agentData[n]?.config?.allowed_peers || []);
+    const supervisors = names.filter(isSup);
+    const workers = names.filter(n => !isSup(n));
 
-    // --- Layered BFS over each connected component (a forest of org trees) ---
-    // Root each component at its highest-degree node -> that lands the CEO / team
-    // lead at the top, direct reports one level down, ICs below them.
-    const depth = {}, parent = {};
-    const visited = new Set();
-    const order = [...names].sort((a,b) => deg(b)-deg(a) || (a<b?-1:1));
+    // --- Classify each link by reciprocity --------------------------------
+    //   mutual  (a lists b AND b lists a)  -> collaboration / peer edge
+    //   one-way (only one side lists)       -> supervision / watch edge (a->b)
+    // A supervisor links to everyone it watches one-directionally, so its
+    // links fall out naturally as watch edges instead of flattening the tree.
+    const mutualAdj = {}; workers.forEach(n => mutualAdj[n] = new Set());
+    const mutualPairs = [], watchEdges = [], seen = new Set();
+    names.forEach(a => peersOf(a).forEach(b => {
+        if (a === b || !agentData[b]) return;
+        if (peersOf(b).has(a)) {                       // reciprocated -> peer
+            const key = [a,b].sort().join(' ');
+            if (seen.has(key)) return; seen.add(key);
+            mutualPairs.push([a,b]);
+            if (mutualAdj[a] && mutualAdj[b]) { mutualAdj[a].add(b); mutualAdj[b].add(a); }
+        } else {                                        // one-way -> watch (a watches b)
+            watchEdges.push([a,b]);
+        }
+    }));
+
+    // --- Org tree over the WORKERS only (supervisors float above) ----------
+    const deg = n => mutualAdj[n] ? mutualAdj[n].size : 0;
+    const depth = {}, parent = {}, visited = new Set();
+    const order = [...workers].sort((a,b) => deg(b)-deg(a) || (a<b?-1:1));
     for (const start of order) {
         if (visited.has(start)) continue;
         const q = [start]; visited.add(start); depth[start]=0; parent[start]=null;
         while (q.length) {
             const u = q.shift();
-            [...adj[u]].sort().forEach(v => {
+            [...mutualAdj[u]].sort().forEach(v => {
                 if (!visited.has(v)) { visited.add(v); depth[v]=depth[u]+1; parent[v]=u; q.push(v); }
             });
         }
     }
-    const maxDepth = Math.max(0, ...names.map(n => depth[n]||0));
+    const maxDepth = Math.max(0, ...workers.map(n => depth[n]||0));
 
-    // --- Tidy-tree x: leaves get sequential slots, parents center over children ---
-    const children = {}; names.forEach(n => children[n]=[]);
-    names.forEach(n => { if (parent[n]!=null) children[parent[n]].push(n); });
-    names.forEach(n => children[n].sort((a,b)=> a<b?-1:1));
+    // --- Tidy-tree x: leaves get sequential slots, parents center over kids -
+    const children = {}; workers.forEach(n => children[n]=[]);
+    workers.forEach(n => { if (parent[n]!=null) children[parent[n]].push(n); });
+    workers.forEach(n => children[n].sort((a,b)=> a<b?-1:1));
     const roots = order.filter(n => parent[n]==null);
     const slot = {}; let nextSlot = 0;
     (function placeAll() {
@@ -809,78 +826,125 @@ function renderNetwork() {
             kids.forEach(place);
             slot[n] = (slot[kids[0]] + slot[kids[kids.length-1]]) / 2;
         };
-        roots.forEach(r => { place(r); nextSlot += 0.6; }); // gap between components
+        roots.forEach(r => { place(r); nextSlot += 0.6; });
     })();
     const leaves = Math.max(1, nextSlot);
 
-    // --- Pixel layout: rows by depth, columns by tidy slot ---
-    const colW = 118, rowH = 112, padX = 64, padY = 50, R = 22;
+    // --- Pixel layout: a band on top for supervisors, then worker rows -----
+    const colW = 124, rowH = 104, padX = 70, padY = 46, R = 22;
+    const supBand = supervisors.length ? 84 : 0;
     const W = Math.round(padX*2 + leaves*colW);
-    const H = Math.round(padY*2 + maxDepth*rowH + 26);
+    const H = Math.round(padY*2 + supBand + maxDepth*rowH + 34);
     svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
     const pos = {};
-    names.forEach(n => { pos[n] = { x: padX + (slot[n]+0.5)*colW, y: padY + (depth[n]||0)*rowH }; });
+    workers.forEach(n => { pos[n] = { x: padX + (slot[n]+0.5)*colW, y: padY + supBand + (depth[n]||0)*rowH }; });
+    supervisors.forEach((n,i) => {
+        const f = supervisors.length === 1 ? 0.5 : i/(supervisors.length-1);
+        pos[n] = { x: padX + f*(W-2*padX), y: padY + 6 };
+    });
 
-    let html = `<defs><marker id="arrow" markerWidth="7" markerHeight="7" refX="${R+2}" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#7B6CFF"/></marker></defs>`;
+    let html = `<defs>
+        <marker id="arrowP" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#7B6CFF"/></marker>
+        <marker id="arrowW" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#5B9DFF"/></marker>
+      </defs>`;
 
-    // --- Edges: solid for reporting lines, faint dashed for lateral/cross links ---
-    let treeCount = 0, linkCount = 0;
-    const drawn = new Set();
-    for (const a of names) {
-        for (const b of (agentData[a]?.config?.allowed_peers || [])) {
-            if (a === b || !pos[b]) continue;
-            const key = a + '->' + b;
-            if (drawn.has(key)) continue;
-            drawn.add(key); linkCount++;
-            const isTree = parent[a] === b || parent[b] === a;
-            if (isTree) treeCount++;
-            const pa = pos[a], pb = pos[b];
-            const style = isTree
-                ? `stroke="#7B6CFF" stroke-width="1.8" stroke-opacity="0.6" marker-end="url(#arrow)"`
-                : `stroke="#8A8A93" stroke-width="1" stroke-opacity="0.16" stroke-dasharray="4 4"`;
-            html += `<line class="conn" x1="${pa.x}" y1="${pa.y}" x2="${pb.x}" y2="${pb.y}" ${style} data-from="${a}" data-to="${b}"/>`;
+    // --- Edge drawing helper: trims to node radius, bows curves clear of nodes
+    const addEdge = (a, b, cls, color, width, opacity, dash, arrow, curve) => {
+        const pa = pos[a], pb = pos[b]; if (!pa || !pb) return;
+        const dx = pb.x-pa.x, dy = pb.y-pa.y, l = Math.hypot(dx,dy) || 1;
+        const ax = pa.x + dx/l*R, ay = pa.y + dy/l*R;
+        const bx = pb.x - dx/l*(R + (arrow?3:0)), by = pb.y - dy/l*(R + (arrow?3:0));
+        let d;
+        if (curve) {
+            const mx = (ax+bx)/2, my = (ay+by)/2;
+            let cx, cy;
+            if (Math.abs(dy) < 8) {                      // same row -> bow downward, more for longer spans
+                cx = mx; cy = my + Math.min(78, Math.abs(dx)*0.5 + 26);
+            } else {                                     // perpendicular arc
+                const off = Math.min(70, l*0.30);
+                cx = mx + (-dy/l)*off; cy = my + (dx/l)*off;
+            }
+            d = `M${ax},${ay} Q${cx.toFixed(1)},${cy.toFixed(1)} ${bx},${by}`;
+        } else {
+            d = `M${ax},${ay} L${bx},${by}`;
         }
-    }
+        html += `<path class="conn ${cls}" d="${d}" fill="none" stroke="${color}" stroke-width="${width}" stroke-opacity="${opacity}"${dash?` stroke-dasharray="${dash}"`:''}${arrow?` marker-end="url(#${arrow})"`:''} data-from="${a}" data-to="${b}"/>`;
+    };
 
-    // --- Nodes ---
+    // Split mutual links into reporting (parent/child) vs lateral peer links.
+    const hierarchy = [], peer = [];
+    mutualPairs.forEach(([a,b]) => {
+        if (parent[a] === b) hierarchy.push([b,a]);
+        else if (parent[b] === a) hierarchy.push([a,b]);
+        else peer.push([a,b]);
+    });
+
+    watchEdges.forEach(([a,b]) => addEdge(a,b,'watch','#5B9DFF',1.4,0.55,'5 4','arrowW',true));
+    peer.forEach(([a,b]) => addEdge(a,b,'peer','#2DD4BF',1.7,0.7,null,null,true));
+    hierarchy.forEach(([a,b]) => addEdge(a,b,'tree','#7B6CFF',2,0.75,null,'arrowP',false));
+
+    // --- Nodes -------------------------------------------------------------
     names.forEach(n => {
-        const p = pos[n], st = agentData[n]?.state || 'idle';
-        const col = st==='idle'?'#3ECF8E':st==='busy'?'#F5B544':st==='asking_human'?'#5B9DFF':'#7B6CFF';
+        const p = pos[n]; if (!p) return;
+        const st = agentData[n]?.state || 'idle', sup = isSup(n);
+        const col = sup ? '#5B9DFF'
+            : st==='idle'?'#3ECF8E':st==='busy'?'#F5B544':st==='asking_human'?'#5B9DFF':'#7B6CFF';
         const full = agentData[n]?.config?.name || n;
         const label = full.length > 17 ? full.slice(0,16)+'…' : full;
-        html += `<g onclick="selectAgent('${jsAttr(n)}')" style="cursor:pointer"><title>${esc(full)}</title>
-            <circle cx="${p.x}" cy="${p.y}" r="${R}" fill="${col}18" stroke="${col}" stroke-width="2"/>
-            <circle cx="${p.x}" cy="${p.y}" r="5" fill="${col}">${st==='busy'?'<animate attributeName="r" values="5;9;5" dur="1.4s" repeatCount="indefinite"/>':''}</circle>
+        const ring = sup
+            ? `<circle cx="${p.x}" cy="${p.y}" r="${R}" fill="${col}14" stroke="${col}" stroke-width="2" stroke-dasharray="3 3"/>`
+            : `<circle cx="${p.x}" cy="${p.y}" r="${R}" fill="${col}18" stroke="${col}" stroke-width="2"/>`;
+        const core = sup
+            ? `<text x="${p.x}" y="${p.y+5}" text-anchor="middle" font-size="16">👁</text>`
+            : `<circle cx="${p.x}" cy="${p.y}" r="5" fill="${col}">${st==='busy'?'<animate attributeName="r" values="5;9;5" dur="1.4s" repeatCount="indefinite"/>':''}</circle>`;
+        html += `<g onclick="selectAgent('${jsAttr(n)}')" style="cursor:pointer"><title>${esc(full)}${sup?' (supervisor)':''}</title>
+            ${ring}${core}
             <text x="${p.x}" y="${p.y+R+14}" text-anchor="middle" fill="#ECECEE" font-size="10.5" font-weight="700" font-family="Manrope, sans-serif">${esc(label)}</text>
             <text x="${p.x}" y="${p.y+R+27}" text-anchor="middle" fill="#8A8A93" font-size="9.5" font-family="JetBrains Mono, monospace">Q:${agentData[n]?.pending_count||0}</text></g>`;
     });
+
+    // --- Legend ------------------------------------------------------------
+    const ly = H - 12;
+    html += `<g font-size="9" font-family="Manrope, sans-serif" pointer-events="none">
+        <line x1="14" y1="${ly}" x2="32" y2="${ly}" stroke="#7B6CFF" stroke-width="2"/><text x="36" y="${ly+3}" fill="#8A8A93">reports</text>
+        <line x1="92" y1="${ly}" x2="110" y2="${ly}" stroke="#2DD4BF" stroke-width="2"/><text x="114" y="${ly+3}" fill="#8A8A93">peers</text>
+        <line x1="160" y1="${ly}" x2="178" y2="${ly}" stroke="#5B9DFF" stroke-width="1.5" stroke-dasharray="4 3"/><text x="182" y="${ly+3}" fill="#8A8A93">watches</text>
+      </g>`;
+
     svg.innerHTML = html;
-    document.getElementById('net-info').textContent = `${names.length} agents · ${treeCount} reporting · ${linkCount-treeCount} lateral`;
+    document.getElementById('net-info').textContent =
+        `${names.length} agents · ${hierarchy.length} reporting · ${peer.length} peer · ${watchEdges.length} watching`;
 }
 
 function animateParticle(fromAgent, toAgent) {
     const svg = document.getElementById('network-svg');
     // Match by reading attributes (not an interpolated selector) so agent names
-    // with quotes/special chars can't throw an invalid-selector error.
-    let line = null;
-    svg.querySelectorAll('line.conn').forEach(l => {
-        if (l.getAttribute('data-from') === fromAgent && l.getAttribute('data-to') === toAgent) line = l;
+    // with quotes/special chars can't throw an invalid-selector error. Mutual
+    // links are drawn once, so accept the reverse orientation and run backward.
+    let exact = null, rev = null;
+    svg.querySelectorAll('path.conn').forEach(l => {
+        const f = l.getAttribute('data-from'), t = l.getAttribute('data-to');
+        if (f === fromAgent && t === toAgent) exact = l;
+        else if (f === toAgent && t === fromAgent) rev = l;
     });
-    if (!line) return;
-    const x1 = +line.getAttribute('x1'), y1 = +line.getAttribute('y1');
-    const x2 = +line.getAttribute('x2'), y2 = +line.getAttribute('y2');
+    const path = exact || rev; if (!path) return;
+    const reverse = !exact;
+    const len = path.getTotalLength();
     const p = document.createElementNS('http://www.w3.org/2000/svg','circle');
     p.setAttribute('r','4'); p.setAttribute('fill','#8B79FF'); p.setAttribute('filter','drop-shadow(0 0 5px #8B79FF)');
     svg.appendChild(p);
     const t0 = performance.now(), dur = 700;
+    const baseOpacity = path.getAttribute('stroke-opacity') || '0.6';
+    const baseWidth = path.getAttribute('stroke-width') || '1.5';
     function step(t) {
         const k = Math.min((t-t0)/dur, 1), e = 1-Math.pow(1-k,3);
-        p.setAttribute('cx', x1+(x2-x1)*e); p.setAttribute('cy', y1+(y2-y1)*e);
+        const pt = path.getPointAtLength((reverse ? 1-e : e) * len);
+        p.setAttribute('cx', pt.x); p.setAttribute('cy', pt.y);
         if (k<1) requestAnimationFrame(step); else p.remove();
     }
     requestAnimationFrame(step);
-    line.setAttribute('stroke-opacity','1'); line.setAttribute('stroke-width','2.5');
-    setTimeout(() => { line.setAttribute('stroke-opacity','0.4'); line.setAttribute('stroke-width','1.5'); }, 800);
+    path.setAttribute('stroke-opacity','1'); path.setAttribute('stroke-width','2.6');
+    setTimeout(() => { path.setAttribute('stroke-opacity', baseOpacity); path.setAttribute('stroke-width', baseWidth); }, 800);
 }
 
 function renderQueues() {
@@ -1135,7 +1199,11 @@ async function loadToolsets() {
         const r = await fetch(`${API_URL}/toolsets`);
         const d = await r.json();
         const dl = document.getElementById('toolset-list');
-        if (dl) dl.innerHTML = (d.toolsets || []).map(ts => `<option value="${esc(ts.name)}">${esc(ts.description || '')}</option>`).join('');
+        if (dl) {
+            const sets = (d.toolsets || []).map(ts => `<option value="${esc(ts.name)}">${esc(ts.description || '')}</option>`);
+            const swarm = (d.swarm_tools || []).map(ts => `<option value="${esc(ts.name)}">swarm tool${ts.required ? ' (required)' : ''} — ${esc(ts.description || '')}</option>`);
+            dl.innerHTML = sets.concat(swarm).join('');
+        }
     } catch (e) { /* non-fatal */ }
 }
 
@@ -1482,6 +1550,7 @@ function selectAgent(name) {
 
 function updateTarget() {
     const tgt = document.getElementById('ctrl-target');
+    if (!tgt) return;  // target dropdown removed — messages go to the selected agent
     const names = Object.keys(agentData).sort();
     tgt.innerHTML = names.map(n => `<option value="${n}">${esc(agentData[n]?.config?.name || n)}</option>`).join('');
 }
@@ -1500,9 +1569,10 @@ async function refreshData() {
 }
 
 async function sendTask() {
-    const target = document.getElementById('ctrl-target').value;
+    const target = selectedAgent;  // send to the currently selected agent
     const payload = document.getElementById('ctrl-payload').value.trim();
-    if (!target || !payload) return;
+    if (!payload) return;
+    if (!target) { logEvent('error', 'Select an agent first'); return; }
     try {
         const res = await fetch(`${API_URL}/agent/${target}/task`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({from_agent:'human_operator', payload}) });
         const data = await res.json();
@@ -1642,6 +1712,29 @@ async function stopAgent(name) {
     if (!confirm(`Stop execution for agent "${name}"?\n\nAll pending tasks for this agent will be marked as done and the agent will go idle.`)) return;
     try {
         const res = await fetch(`${API_URL}/agent/${encodeURIComponent(name)}/stop`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) { logEvent('error', data.error); return; }
+        logEvent('system', data.message);
+    } catch (e) { logEvent('error', e.message); }
+}
+
+async function pauseAgent(name) {
+    const reason = prompt(`Emergency PAUSE for "${name}"?\n\nThis interrupts its current turn immediately but PRESERVES its queue (resume to continue). Optional reason:`, '');
+    if (reason === null) return; // cancelled
+    try {
+        const res = await fetch(`${API_URL}/agent/${encodeURIComponent(name)}/pause`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: reason || 'Paused by operator' }),
+        });
+        const data = await res.json();
+        if (data.error) { logEvent('error', data.error); return; }
+        logEvent('system', data.message);
+    } catch (e) { logEvent('error', e.message); }
+}
+
+async function resumeAgent(name) {
+    try {
+        const res = await fetch(`${API_URL}/agent/${encodeURIComponent(name)}/resume`, { method: 'POST' });
         const data = await res.json();
         if (data.error) { logEvent('error', data.error); return; }
         logEvent('system', data.message);
