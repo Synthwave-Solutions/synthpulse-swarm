@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -953,6 +954,92 @@ class AgentDaemon:
                     + text[-SUPERVISOR_FEED_CHAR_CAP:])
         return text
 
+    # Tool calls that do NOT advance the mission by themselves — coordination and
+    # bookkeeping. Anything else (web/file/terminal/browser/email/code/git…) is a
+    # "concrete action" that touches the real world.
+    _NONACTION_TOOLS = {
+        "send_peer_message", "log_changes", "todo", "memory",
+        "get_self_config", "ask_human", "request_human_takeover",
+        "request_config_change", "schedule_wakeup", "cancel_wakeup",
+    }
+
+    @staticmethod
+    def _norm_msg(text: str) -> str:
+        """Normalize an assistant message to its intent so near-duplicate status
+        re-confirmations collapse to one key. Drops the tool RESULT (everything
+        after '→'), lowercases, keeps alnum+space."""
+        t = text.split("→", 1)[0]
+        t = re.sub(r"[^a-z0-9 ]+", " ", t.lower())
+        return re.sub(r"\s+", " ", t).strip()[:200]
+
+    def _assess_peer_progress(self, peer: str, msgs: List[Dict[str, Any]]) -> str:
+        """Deterministically classify a peer's review window so the supervisor
+        judges PROGRESS, not token volume. Computed in code (not left to the
+        model's eye) so the no-progress ACK loop the supervisors kept missing is
+        now an explicit flag on every review."""
+        actions: List[str] = []
+        reports = logs = prose = 0
+        norm_keys: List[str] = []
+        for m in msgs:
+            if (m.get("role") or "") != "assistant":
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            tools = re.findall(r"🛠️\s*([a-z_]+)\(", content)
+            if not tools:
+                prose += 1  # free-text only — reaches nobody
+            for t in tools:
+                if t == "send_peer_message":
+                    reports += 1
+                elif t == "log_changes":
+                    logs += 1
+                elif t not in self._NONACTION_TOOLS:
+                    actions.append(t)
+            norm_keys.append(self._norm_msg(content))
+
+        n = len(norm_keys)
+        concrete = len(actions)
+        seen: Dict[str, int] = {}
+        for k in norm_keys:
+            seen[k] = seen.get(k, 0) + 1
+        dup_turns = sum(c - 1 for c in seen.values() if c > 1)
+        top_repeat = max(seen.values()) if seen else 0
+
+        parts = [
+            f"PROGRESS SIGNAL (computed, not prose): {n} turns this window — "
+            f"{concrete} concrete external action(s)"
+            + (f" ({', '.join(sorted(set(actions))[:6])})" if actions else "")
+            + f", {reports} peer-message(s), {logs} log(s), {prose} free-text-only."
+        ]
+        if n >= 3 and concrete == 0 and (dup_turns >= 2 or top_repeat >= 3):
+            parts.append(
+                f"⚠ NO-PROGRESS LOOP: {dup_turns} of {n} turns are near-duplicate "
+                f"re-confirmations of an earlier turn and ZERO concrete actions were "
+                f"taken. {peer} is repeating itself, not progressing — this is exactly "
+                f"the drift you must break. Do NOT acknowledge it; steer it to ONE "
+                f"concrete next action (or escalate)."
+            )
+        elif concrete == 0 and n >= 2:
+            parts.append(
+                f"⚠ NO CONCRETE ACTION this window — {peer} only coordinated/logged. "
+                f"If it had a real task, that task did not move."
+            )
+        try:  # latest out-of-band digest — the 'stuck' signal, now wired in
+            d = monitor_db.get_last_digest(peer)
+            if d:
+                s = json.loads(d.get("summary") or "{}")
+                risk = s.get("risk_level")
+                if risk and risk != "ok":
+                    parts.append(
+                        f"DIGEST: risk={risk}; {s.get('headline', '')}"
+                        + (f"; blocked_on={s.get('blocked_on')}"
+                           if s.get("blocked_on") else "")
+                    )
+        except Exception:
+            pass
+        return "\n".join(parts)
+
     def _maybe_feed_supervisor(self) -> None:
         """Supervisor agents only: push each linked peer's recent transcript into
         THIS agent's own queue once the peer accrues enough new activity.
@@ -1004,8 +1091,10 @@ class AgentDaemon:
                 return
             max_id = max(int(m["id"]) for m in msgs)
             transcript = self._render_feed_transcript(msgs)
+            progress_signal = self._assess_peer_progress(peer, msgs)
             prompt = SUPERVISOR_FEED_PROMPT.format(
-                peer=peer, tokens=tokens, transcript=transcript
+                peer=peer, tokens=tokens, transcript=transcript,
+                progress_signal=progress_signal,
             )
             self._sup_watermark[peer] = max_id
             monitor_db.log_event(
