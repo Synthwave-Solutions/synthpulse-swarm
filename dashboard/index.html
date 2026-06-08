@@ -165,6 +165,27 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
 .msg-body pre { background: var(--bg-input); padding: 10px; border-radius: var(--r-sm); overflow-x: auto; font-size: 11px; font-family: var(--font-mono); margin-top: 8px; white-space: pre-wrap; border: 1px solid var(--border); }
 .msg-body .tool-call { background: rgba(167,139,250,0.07); border-left: 2px solid var(--tool); padding: 7px 11px; margin: 8px 0; border-radius: 0 var(--r-sm) var(--r-sm) 0; font-family: var(--font-mono); font-size: 11px; }
 .msg-role-badge.compaction_summary { background: rgba(245,181,68,0.16); color: var(--busy); }
+/* ===== RENDERED MARKDOWN (messages, live answer, reasoning) ===== */
+.md { line-height: 1.6; word-break: break-word; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 12px 0 6px; line-height: 1.3; font-weight: 700; letter-spacing: -0.01em; }
+.md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; } .md h3 { font-size: 1.08em; }
+.md h4, .md h5, .md h6 { font-size: 1em; color: var(--text-muted); }
+.md ul, .md ol { margin: 6px 0 8px; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md a { color: var(--accent-bright); text-decoration: underline; text-underline-offset: 2px; }
+.md a:hover { color: var(--accent); }
+.md strong { font-weight: 700; color: var(--text); }
+.md em { font-style: italic; }
+.md del { opacity: 0.65; }
+.md code.md-code { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-family: var(--font-mono); font-size: 0.9em; }
+.md pre.md-pre { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+.md pre.md-pre code { font-family: var(--font-mono); font-size: 11px; white-space: pre; background: none; border: none; padding: 0; color: var(--text); }
+.md blockquote { margin: 6px 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--border-strong); color: var(--text-muted); }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+.exec-step.reasoning .md, .exec-step.answer .md { font-size: 12.5px; }
 /* Compaction checkpoint divider in the History transcript */
 .cc-checkpoint { margin: 14px 0; border: 1px solid var(--busy); border-radius: var(--r-md); overflow: hidden; background: rgba(245,181,68,0.05); }
 .cc-divider { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 11px; font-weight: 700; color: var(--busy); text-transform: uppercase; letter-spacing: 0.5px; }
@@ -1162,9 +1183,10 @@ function addMessageToUI(msg) {
 }
 
 function formatMessageContent(msg) {
-    let text = esc(msg.content || '');
-    if (text.startsWith('🛠️ Tool Calls:') || text.startsWith('📤 Tool Result')) {
-        return `<pre>${text}</pre>`;
+    const raw = msg.content || '';
+    // Tool-call / tool-result dumps are pre-formatted text — keep them verbatim.
+    if (raw.startsWith('🛠️ Tool Calls:') || raw.startsWith('📤 Tool Result')) {
+        return `<pre>${esc(raw)}</pre>`;
     }
     if (msg.tool_calls) {
         let html = '';
@@ -1172,9 +1194,9 @@ function formatMessageContent(msg) {
             const fn = tc.function || {};
             html += `<div class="tool-call"><strong>${esc(fn.name || '?')}</strong><pre>${esc(fn.arguments || '{}')}</pre></div>`;
         });
-        return html + (text ? `<div style="margin-top:6px">${text}</div>` : '');
+        return html + (raw ? `<div class="md" style="margin-top:6px">${mdToHtml(raw)}</div>` : '');
     }
-    return text ? text.replace(/\n/g, '<br>') : '<em style="color:var(--text-muted)">(no text content)</em>';
+    return raw ? `<div class="md">${mdToHtml(raw)}</div>` : '<em style="color:var(--text-muted)">(no text content)</em>';
 }
 
 /* ===== LIVE EXECUTION TRACE ===== */
@@ -1248,10 +1270,18 @@ function handleAgentExec(p) {
         case 'thinking':
             execStatus[ag] = p.text ? p.text : 'thinking…';
             break;
-        case 'reasoning':
-            (execTrace[ag] = execTrace[ag] || []).push({ type: 'reasoning', text: p.text || '' });
+        case 'reasoning': {
+            // Hermes streams chain-of-thought in chunks (often a word at a time),
+            // firing this once per chunk. Merge consecutive chunks into the SAME
+            // box instead of spawning one box per word — but a tool call in
+            // between ends the current thought, so the next reasoning starts fresh.
+            const arr = (execTrace[ag] = execTrace[ag] || []);
+            const last = arr[arr.length - 1];
+            if (last && last.type === 'reasoning') last.text += (p.text || '');
+            else arr.push({ type: 'reasoning', text: p.text || '' });
             execStatus[ag] = null;
             break;
+        }
         case 'tool_start':
             (execTrace[ag] = execTrace[ag] || []).push({ type: 'tool', id: p.id, name: p.name, args: p.args || '', result: null });
             execStatus[ag] = `running ${p.name}…`;
@@ -1298,7 +1328,7 @@ function renderExecTrace() {
         } else if (s.type === 'user') {
             html += `<div class="exec-step usermsg"><div class="exec-label">👤 User / Task</div><pre>${esc(s.text)}</pre></div>`;
         } else if (s.type === 'reasoning') {
-            html += `<div class="exec-step reasoning"><div class="exec-label">🧠 Thinking</div><pre>${esc(s.text)}</pre></div>`;
+            html += `<div class="exec-step reasoning"><div class="exec-label">🧠 Thinking</div><div class="md">${mdToHtml(s.text)}</div></div>`;
         } else if (s.type === 'tool') {
             const obs = s.result != null
                 ? `<div class="exec-obs"><strong>↳ Output</strong><pre>${esc(s.result)}</pre></div>`
@@ -1307,7 +1337,7 @@ function renderExecTrace() {
         }
     });
     if (answer) {
-        html += `<div class="exec-step answer"><div class="exec-label">✍️ Response</div><div style="margin-top:6px;white-space:pre-wrap;word-break:break-word">${esc(answer)}</div></div>`;
+        html += `<div class="exec-step answer"><div class="exec-label">✍️ Response</div><div class="md" style="margin-top:6px;word-break:break-word">${mdToHtml(answer)}</div></div>`;
     }
     if (status) {
         html += `<div class="exec-status"><span class="live-dot"></span>${esc(status)}</div>`;
@@ -1775,6 +1805,55 @@ function esc(s) {
     const div = document.createElement('div');
     div.textContent = s;
     return div.innerHTML;
+}
+
+// Minimal, XSS-safe markdown → HTML for agent/LLM output. Everything is
+// HTML-escaped first; only a fixed whitelist of tags is then introduced, and
+// link hrefs are restricted to http(s)/root-relative, so no raw markup or
+// javascript: URI can slip through. No external library — keeps this file
+// self-contained and offline-capable.
+function mdToHtml(raw) {
+    if (raw === null || raw === undefined || raw === '') return '';
+    let src = String(raw).replace(/\r\n/g, '\n');
+    // 1) Lift fenced code blocks out so their contents aren't transformed.
+    const blocks = [];
+    src = src.replace(/```[\w+-]*\n?([\s\S]*?)```/g, (m, code) => {
+        blocks.push('<pre class="md-pre"><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>');
+        return '[[[CBLK:' + (blocks.length - 1) + ']]]';
+    });
+    // 2) Escape everything else.
+    src = esc(src);
+    // 3) Inline code (content is already escaped).
+    src = src.replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>');
+    // 4) Inline emphasis + links (asterisks/underscores/brackets survive esc()).
+    src = src
+        .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
+        .replace(/(^|[^\w*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+        .replace(/(^|[^\w_])_([^_\n]+?)_(?=[^\w]|$)/g, '$1<em>$2</em>')
+        .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+        .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g,
+            '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    // 5) Block assembly, line by line (headings, lists, quotes, rules, paras).
+    const lines = src.split('\n');
+    let html = '', listType = null, para = [];
+    const flushPara = () => { if (para.length) { html += '<p>' + para.join('<br>') + '</p>'; para = []; } };
+    const closeList = () => { if (listType) { html += '</' + listType + '>'; listType = null; } };
+    for (const line of lines) {
+        let m;
+        if ((m = line.match(/^\[\[\[CBLK:(\d+)\]\]\]$/))) { flushPara(); closeList(); html += blocks[+m[1]]; continue; }
+        if (/^\s*$/.test(line)) { flushPara(); closeList(); continue; }
+        if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); closeList(); const lv = m[1].length; html += `<h${lv}>${m[2]}</h${lv}>`; continue; }
+        if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); closeList(); html += '<hr>'; continue; }
+        if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) { flushPara(); if (listType !== 'ul') { closeList(); html += '<ul>'; listType = 'ul'; } html += '<li>' + m[1] + '</li>'; continue; }
+        if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) { flushPara(); if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; } html += '<li>' + m[1] + '</li>'; continue; }
+        if ((m = line.match(/^&gt;\s?(.*)$/))) { flushPara(); closeList(); html += '<blockquote>' + m[1] + '</blockquote>'; continue; }
+        para.push(line);
+    }
+    flushPara(); closeList();
+    // Safety net: any code-block placeholder not on its own line.
+    html = html.replace(/\[\[\[CBLK:(\d+)\]\]\]/g, (m, i) => blocks[+i] || '');
+    return html;
 }
 
 // Escape a value for safe embedding inside  onclick="fn('<HERE>')".
