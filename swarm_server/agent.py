@@ -482,11 +482,16 @@ class AgentDaemon:
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
                     self._ai_agent.tools.append(_REQUEST_HUMAN_TAKEOVER_TOOL_SCHEMA)
                     self._ai_agent.valid_tool_names.add("request_human_takeover")
-                if "log_changes" not in existing_names and "log_changes" not in disabled:
-                    from swarm_server.tools import _LOG_CHANGES_TOOL_SCHEMA
+                if "log_decision" not in existing_names and "log_decision" not in disabled:
+                    from swarm_server.tools import _LOG_DECISION_TOOL_SCHEMA
                     self._ai_agent.tools = list(self._ai_agent.tools or [])
-                    self._ai_agent.tools.append(_LOG_CHANGES_TOOL_SCHEMA)
-                    self._ai_agent.valid_tool_names.add("log_changes")
+                    self._ai_agent.tools.append(_LOG_DECISION_TOOL_SCHEMA)
+                    self._ai_agent.valid_tool_names.add("log_decision")
+                if "log_action" not in existing_names and "log_action" not in disabled:
+                    from swarm_server.tools import _LOG_ACTION_TOOL_SCHEMA
+                    self._ai_agent.tools = list(self._ai_agent.tools or [])
+                    self._ai_agent.tools.append(_LOG_ACTION_TOOL_SCHEMA)
+                    self._ai_agent.valid_tool_names.add("log_action")
                 # Self-awareness: read own config/telemetry + PROPOSE changes
                 # (human approves in the UI — agents cannot self-apply).
                 from swarm_server.tools import (
@@ -958,7 +963,7 @@ class AgentDaemon:
     # bookkeeping. Anything else (web/file/terminal/browser/email/code/git…) is a
     # "concrete action" that touches the real world.
     _NONACTION_TOOLS = {
-        "send_peer_message", "log_changes", "todo", "memory",
+        "send_peer_message", "log_decision", "log_action", "todo", "memory",
         "get_self_config", "ask_human", "request_human_takeover",
         "request_config_change", "schedule_wakeup", "cancel_wakeup",
     }
@@ -992,7 +997,7 @@ class AgentDaemon:
             for t in tools:
                 if t == "send_peer_message":
                     reports += 1
-                elif t == "log_changes":
+                elif t == "log_decision":
                     logs += 1
                 elif t not in self._NONACTION_TOOLS:
                     actions.append(t)
@@ -1304,17 +1309,27 @@ class AgentDaemon:
             # same port, so the cdp_url already in config.yaml stays valid — no
             # rewrite needed on the happy path (this is just a health probe).
             team_browser_manager.ensure_team_browser(self.cfg.get("team_id", "default"))
-            # Refresh the dynamic half of the ephemeral system prompt (live project
-            # tree + last 10 peer messages). Injected at API-call time, so updating
-            # it here keeps the context current WITHOUT invalidating the cached
-            # stable/context/volatile system prompt.
+            # Build the dynamic per-turn live context (project tree + last 10 peer
+            # messages + minute-precise time). CRITICAL: this changes every turn,
+            # so it must NOT go into the system message. The system message sits at
+            # position 0, ahead of the whole conversation history; mutating its tail
+            # ends the upstream prefix-cache match there and forces the ENTIRE
+            # history to be re-billed as uncached input every turn. Instead we keep
+            # ephemeral_system_prompt pinned to the STABLE base (so [system + tools +
+            # history] is a byte-stable cacheable prefix) and prepend the volatile
+            # live context to the FINAL user turn, where it costs only its own tokens.
             try:
                 base = getattr(self, "_base_ephemeral", None)
                 if base is not None:
+                    # Pin the system prompt to the stable base (it may have been left
+                    # as base+live by an older build / prior turn).
+                    if self._ai_agent.ephemeral_system_prompt != base:
+                        self._ai_agent.ephemeral_system_prompt = base
                     live = compose_live_context(
                         self.cfg.get("team_id", "default"), self.name, load_agents_config()
                     )
-                    self._ai_agent.ephemeral_system_prompt = base + "\n\n" + live
+                    if live:
+                        combined = f"{live}\n\n{combined}"
             except Exception as e:
                 log.debug("[%s] live-context refresh failed: %s", self.name, e)
             history = self._load_session_from_db()

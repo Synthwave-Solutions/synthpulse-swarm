@@ -303,7 +303,23 @@ TOOL_OUTPUT_MAX_LINE_LENGTH = 2000
 # unique task_id now gets its own tab in the shared Chrome. Keep this list as
 # the hook for disabling toolsets in the future.
 # ---------------------------------------------------------------------------
-DISABLED_TOOLSETS: List[str] = []
+# Hermes ships ~71 tools across many toolsets; every enabled tool's JSON schema
+# is re-sent on EVERY turn (measured ~11k tokens for the default selection) and
+# several toolsets also inject a multi-hundred-token guidance block into the
+# system prompt. This swarm only ever uses browser + terminal/code + file ops +
+# web search + memory/todo + its own custom peer/escalation tools, so we disable
+# the rest. This trims per-turn tool-schema tokens and removes the skills /
+# session_search guidance blocks. (Removing `delegation` also matches the soul,
+# which already tells agents delegate_task is disabled — use send_peer_message.)
+DISABLED_TOOLSETS: List[str] = [
+    "session_search",  # cross-session search — unused; also drops its guidance block
+    "delegation",      # delegate_task — soul says disabled; peers via send_peer_message
+    "tts",             # text_to_speech
+    "image_gen", "video_gen", "video", "vision",  # media generation — not used
+    "spotify", "homeassistant", "discord", "discord_admin",
+    "feishu_doc", "feishu_drive", "hermes-yuanbao",
+    "moa", "messaging",  # third-party integrations the swarm never calls
+]
 
 # ---------------------------------------------------------------------------
 # Queue / sweep behavior
@@ -364,6 +380,32 @@ DIGEST_INPUT_CHAR_CAP = int(os.environ.get("SWARM_DIGEST_INPUT_CHAR_CAP", "24000
 DIGEST_ENABLED_DEFAULT = os.environ.get("SWARM_DIGEST_ENABLED", "1") not in ("0", "false", "False", "")
 
 # ---------------------------------------------------------------------------
+# Global loop detector (Layer 5 — emergent, swarm-wide). Per-agent supervision
+# can't see a loop that spans agents (A↔B↔C ping-pong); this watches the whole
+# team's message graph and nudges to break a no-progress storm.
+# ---------------------------------------------------------------------------
+LOOP_DETECT_ENABLED = os.environ.get("SWARM_LOOP_DETECT", "1") not in ("0", "false", "False", "")
+LOOP_SWEEP_INTERVAL_SECONDS = int(os.environ.get("SWARM_LOOP_SWEEP_SECONDS", "120"))
+# Window of recent message history each scan considers.
+LOOP_WINDOW_SECONDS = int(os.environ.get("SWARM_LOOP_WINDOW_SECONDS", "600"))
+# A single pair (A↔B) trading at least this many WAKING messages in the window,
+# with mostly repeated content, is a ping-pong loop.
+LOOP_PAIR_THRESHOLD = int(os.environ.get("SWARM_LOOP_PAIR_THRESHOLD", "6"))
+# The team sending at least this many messages in the window while logging ZERO
+# decisions AND ZERO actions is a team-wide stall ("everyone talks, nobody ships").
+LOOP_TEAM_MSG_THRESHOLD = int(os.environ.get("SWARM_LOOP_TEAM_MSG_THRESHOLD", "14"))
+# Don't re-alert the same signature within this cooldown.
+LOOP_ALERT_COOLDOWN_SECONDS = int(os.environ.get("SWARM_LOOP_COOLDOWN_SECONDS", "900"))
+
+# ---------------------------------------------------------------------------
+# Decision-log rollup. The prompt injects the last DECISION_LIVE_WINDOW decisions;
+# once unrolled decisions exceed DECISION_ROLLUP_TRIGGER, the oldest beyond the
+# live window are summarized into a milestone so long-term memory isn't lost.
+# ---------------------------------------------------------------------------
+DECISION_LIVE_WINDOW = int(os.environ.get("SWARM_DECISION_LIVE_WINDOW", "20"))
+DECISION_ROLLUP_TRIGGER = int(os.environ.get("SWARM_DECISION_ROLLUP_TRIGGER", "40"))
+
+# ---------------------------------------------------------------------------
 # Supervisor agents (Layer 4 observability)
 # ---------------------------------------------------------------------------
 # A supervisor is an ordinary Hermes agent flagged is_supervisor and LINKED to
@@ -411,9 +453,11 @@ def _derive_workspace_path(team_id: str, agent_name: str) -> Path:
 def _get_team_workspace_path(team_id: str) -> Path:
     """Return the shared team workspace directory.
 
-    Holds team-shared metadata — the project brief (workspace.md), the changelog
-    (agent_log.md), and each agent's per-agent runtime home (.hermes + queue db).
-    This is NOT where code/deliverables go; that is the shared project dir below.
+    Holds team-shared metadata — the project brief (workspace.md) and each
+    agent's per-agent runtime home (.hermes + queue db). The team changelog is no
+    longer a file (agent_log.md is sunset); decisions live in the decision log
+    (monitoring.db). This is NOT where code/deliverables go; that is the shared
+    project dir below.
     """
     return WORKSPACE_ROOT / team_id / "workspace"
 
@@ -869,14 +913,9 @@ def create_team(cfg: Dict[str, Any], team_id: str, name: str) -> Dict[str, Any]:
             "- path/to/file: description\n",
             encoding="utf-8",
         )
-    # Create shared agent_log.md
-    agent_log = team_ws / "agent_log.md"
-    if not agent_log.exists():
-        agent_log.write_text(
-            "# Team Activity Log\n\n"
-            "Format: `[YYYY-MM-DD HH:MM:SS] agent_name: message`\n\n",
-            encoding="utf-8",
-        )
+    # NOTE: agent_log.md is sunset — the team activity trail is now the
+    # decision log (monitoring.db `decisions` table, written via the
+    # log_decision tool and auto-injected into prompts). No file to seed.
     _save_full_config(cfg)
     return cfg["teams"][team_id]
 
@@ -945,13 +984,8 @@ def create_agent(
     ws = _derive_workspace_path(team_id, name)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "context").mkdir(exist_ok=True)
-    # Create agent-specific log
-    agent_log = ws / "agent_log.md"
-    if not agent_log.exists():
-        agent_log.write_text(
-            f"# {display_name} Activity Log\n\n",
-            encoding="utf-8",
-        )
+    # agent_log.md is sunset — see make_team(); decisions now live in the
+    # shared decision log (log_decision tool -> monitoring.db).
     _save_full_config(cfg)
     return agent_cfg
 

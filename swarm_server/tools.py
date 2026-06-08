@@ -141,14 +141,42 @@ _SEND_PEER_MESSAGE_TOOL_SCHEMA = {
     "function": {
         "name": "send_peer_message",
         "description": (
-            "Send a message to another agent in the swarm. The target will pick it up "
-            "on its next sweep and process it. Use this to chat, pass results, or delegate work."
+            "Send a message to a linked peer. The `kind` controls whether it WAKES the "
+            "recipient — choose it deliberately, it is how the swarm avoids endless "
+            "status ping-pong:\n"
+            "• TASK — delegate concrete work. WAKES them; they owe you a RESULT. Returns a "
+            "task_id.\n"
+            "• QUESTION — ask something you need answered to proceed. WAKES them. Returns a "
+            "task_id.\n"
+            "• RESULT — report a finished deliverable back to whoever delegated it. WAKES "
+            "that one peer and CLOSES the task. Pass `reply_to` = the task_id you were given.\n"
+            "• STATUS — a progress update. Does NOT wake anyone; it just appears in the "
+            "team's recent-messages feed. Use this instead of a TASK when you have nothing "
+            "for them to DO.\n"
+            "• FYI — informational note. Does NOT wake anyone.\n"
+            "NEVER send a TASK/QUESTION just to acknowledge or confirm — that creates a "
+            "loop. If you have no concrete ask, use STATUS/FYI (or send nothing)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "to_agent": {"type": "string", "description": "Name of the target agent."},
-                "message": {"type": "string", "description": "The message to send."},
+                "to_agent": {"type": "string", "description": "Name of the target linked peer."},
+                "message": {"type": "string", "description": "The message body."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["TASK", "QUESTION", "RESULT", "STATUS", "FYI"],
+                    "description": (
+                        "Message type. TASK/QUESTION/RESULT wake the recipient; STATUS/FYI "
+                        "do not. Defaults to TASK if omitted."
+                    ),
+                },
+                "reply_to": {
+                    "type": "string",
+                    "description": (
+                        "For kind=RESULT only: the task_id of the TASK/QUESTION you are "
+                        "answering, so the system can close it."
+                    ),
+                },
             },
             "required": ["to_agent", "message"],
         },
@@ -200,24 +228,73 @@ _REQUEST_HUMAN_TAKEOVER_TOOL_SCHEMA = {
     },
 }
 
-_LOG_CHANGES_TOOL_SCHEMA = {
+_LOG_DECISION_TOOL_SCHEMA = {
     "type": "function",
     "function": {
-        "name": "log_changes",
+        "name": "log_decision",
         "description": (
-            "Log an important event, status update, or completed task to the shared team activity log. "
-            "Use this after completing work, making decisions, or when something notable happens. "
-            "This helps the whole team stay informed."
+            "Append ONE significant decision to the shared team decision log. The last "
+            "20 entries are auto-injected into every agent's prompt each turn, so this is "
+            "how the team stays aware without reading a file. Use SPARINGLY — only for "
+            "decisions others must know (e.g. 'Switched checkout to live_mode', 'Verified "
+            "signup flow returns 200'). Do NOT log trivial actions, acknowledgements, or "
+            "status chatter. Entries are append-only and read-only once written."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "entry": {
+                "decision": {
                     "type": "string",
-                    "description": "The log entry text. Be concise but informative.",
+                    "description": (
+                        "The decision as a SINGLE line of plain text (no newlines, no "
+                        "markdown). Be specific and verifiable."
+                    ),
                 },
             },
-            "required": ["entry"],
+            "required": ["decision"],
+        },
+    },
+}
+
+_LOG_ACTION_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "log_action",
+        "description": (
+            "Claim/record a side-effecting EXTERNAL action (sending an email, publishing "
+            "a post, deploying, taking a payment) under a stable idempotency_key so two "
+            "agents can't double-do it. Call it RIGHT BEFORE you perform the action: if it "
+            "returns duplicate=true, someone already did this exact thing — DO NOT repeat "
+            "it; use their recorded outcome. If duplicate=false you hold the claim — do the "
+            "action, then optionally call again with the same key plus the outcome/verified "
+            "proof. The idempotency_key must uniquely identify the action (e.g. "
+            "'email:jane@acme.com:launch-invite', 'publish:linkedin:2026-06-08-post')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action_type": {
+                    "type": "string",
+                    "description": "Kind of action, e.g. email_send, publish, deploy, payment.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable unique id for THIS action so it's never done twice.",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "What it acts on (recipient, URL, service). Optional.",
+                },
+                "outcome": {
+                    "type": "string",
+                    "description": "Verifiable result/proof once done (message-id, live URL). Optional.",
+                },
+                "verified": {
+                    "type": "boolean",
+                    "description": "True only if you hold machine-verifiable proof it succeeded.",
+                },
+            },
+            "required": ["action_type", "idempotency_key"],
         },
     },
 }
@@ -395,7 +472,8 @@ REQUIRED_SWARM_TOOLS = ("send_peer_message",)
 _SWARM_TOOL_SCHEMAS = (
     _SEND_PEER_MESSAGE_TOOL_SCHEMA,
     _ASK_HUMAN_TOOL_SCHEMA,
-    _LOG_CHANGES_TOOL_SCHEMA,
+    _LOG_DECISION_TOOL_SCHEMA,
+    _LOG_ACTION_TOOL_SCHEMA,
     _GET_SELF_CONFIG_TOOL_SCHEMA,
     _REQUEST_CONFIG_CHANGE_TOOL_SCHEMA,
     _SCHEDULE_WAKEUP_TOOL_SCHEMA,
@@ -472,29 +550,82 @@ def _send_peer_message_handler(args: dict, **kwargs) -> str:
             ),
         })
 
-    task_id = target.ingest_task(from_agent=caller, payload=message)
-    log.info("[send_peer_message] %s -> %s | task_id=%s", caller, to_agent, task_id[:8])
+    import time as _time
+    import uuid as _uuid
+
+    # Typed messages: kind decides whether the recipient is WOKEN. STATUS/FYI are
+    # passive (they surface in the recipient's recent-messages feed but create no
+    # task), which is the structural cure for the acknowledge/status ping-pong —
+    # an agent literally cannot wake a peer just to confirm a status.
+    kind = (args.get("kind") or "TASK").strip().upper()
+    if kind not in ("TASK", "QUESTION", "RESULT", "STATUS", "FYI"):
+        kind = "TASK"
+    reply_to = (args.get("reply_to") or "").strip()
+    team_id = cfg["agents"].get(caller, {}).get("team_id")
+    waking = kind in ("TASK", "QUESTION", "RESULT")
+    msg_id = _uuid.uuid4().hex[:8]
+
+    task_id = None
+    if waking:
+        # Embed a correlation header so the recipient can reference this thread in
+        # its RESULT (the from_agent is already shown by the batch builder).
+        if kind in ("TASK", "QUESTION"):
+            header = (
+                f"[{kind} · id={msg_id} · from {caller} — when done, reply with "
+                f"send_peer_message(to_agent=\"{caller}\", kind=\"RESULT\", "
+                f"reply_to=\"{msg_id}\")]\n"
+            )
+        else:  # RESULT
+            header = f"[RESULT · from {caller}" + (f" · re {reply_to}" if reply_to else "") + "]\n"
+        task_id = target.ingest_task(from_agent=caller, payload=header + message)
+        if kind in ("TASK", "QUESTION"):
+            monitor_db.open_delegation(msg_id, caller, to_agent, kind,
+                                       summary=message[:160], team_id=team_id)
+        elif kind == "RESULT" and reply_to:
+            monitor_db.answer_delegation(reply_to, by_agent=caller)
+        log.info("[send_peer_message] %s -%s-> %s | id=%s task=%s",
+                 caller, kind, to_agent, msg_id, (task_id or "")[:8])
+    else:
+        # STATUS / FYI — recorded for awareness, but NOT enqueued and NOT woken.
+        log.info("[send_peer_message] %s -%s-> %s | id=%s (passive, no wake)",
+                 caller, kind, to_agent, msg_id)
 
     # Persist the peer message (not just broadcast it) so historical/REST queries
     # can reconstruct the conversation graph, not only the live dashboard.
     monitor_db.log_event(
         caller, "message_sent",
         from_agent=caller, to_agent=to_agent, task_id=task_id,
-        data={"message_preview": message[:120]},
+        data={"message_preview": message[:120], "kind": kind, "msg_id": msg_id,
+              "waking": waking},
     )
 
     _broadcast("message_sent", {
         "from_agent": caller,
         "to_agent": to_agent,
         "task_id": task_id,
+        "kind": kind,
+        "waking": waking,
         "message_preview": message[:120],
-        "timestamp": __import__("time").time(),
+        "timestamp": _time.time(),
     })
+
+    if not waking:
+        return json.dumps({
+            "success": True,
+            "kind": kind,
+            "delivered": "passive",
+            "message": (
+                f"{kind} delivered to '{to_agent}' (passive — it will see this in its "
+                f"recent-messages feed; it was NOT woken and owes no reply)."
+            ),
+        })
 
     return json.dumps({
         "success": True,
+        "kind": kind,
         "task_id": task_id,
-        "message": f"Message enqueued to '{to_agent}' successfully.",
+        "msg_id": msg_id,
+        "message": f"{kind} enqueued to '{to_agent}' successfully.",
     })
 
 
@@ -683,66 +814,83 @@ def _request_human_takeover_handler(args: dict, **kwargs) -> str:
     })
 
 
-def _log_changes_handler(args: dict, **kwargs) -> str:
+def _log_decision_handler(args: dict, **kwargs) -> str:
     import time
-    from datetime import datetime
 
-    entry = args.get("entry", "")
+    decision = args.get("decision", "") or args.get("entry", "")  # accept legacy key
     task_id_arg = kwargs.get("task_id", "")
     caller = "unknown"
     if task_id_arg and task_id_arg.startswith("agent_name:"):
         caller = task_id_arg.split(":", 1)[1]
 
-    if not entry.strip():
-        return json.dumps({"success": False, "error": "Empty log entry."})
+    # Collapse to a single line — the decision log is a scannable one-liner feed.
+    one_line = " ".join((decision or "").split()).strip()
+    if not one_line:
+        return json.dumps({"success": False, "error": "Empty decision."})
 
-    # Get team_id from config
-    from swarm_server.config import (
-        load_agents_config,
-        _get_team_workspace_path,
-        _derive_workspace_path,
-    )
+    from swarm_server.config import load_agents_config
 
     cfg = load_agents_config()
-    caller_cfg = cfg["agents"].get(caller, {})
-    team_id = caller_cfg.get("team_id", "default")
+    team_id = cfg["agents"].get(caller, {}).get("team_id", "default")
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_line = f"# [{timestamp}] {caller}: {entry}\n\n"
-
-    def _append(path, header: str) -> None:
-        """Append the entry to a log file, seeding a header if it's new."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(log_line)
-        else:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(header)
-                f.write(log_line)
-
-    # Write to BOTH the shared team log (the canonical project changelog every
-    # teammate reads) AND the caller's own per-agent log (their personal
-    # activity trail). One log_changes call -> two destinations.
-    team_log = _get_team_workspace_path(team_id) / "agent_log.md"
-    agent_log = _derive_workspace_path(team_id, caller) / "agent_log.md"
-    try:
-        _append(team_log, "# Team Activity Log\n\n")
-        _append(agent_log, f"# {caller} Activity Log\n\n")
-        log.info("[log_changes] %s logged (team + self): %s", caller, entry[:80])
-    except Exception as e:
-        log.warning("[log_changes] Failed to write log for %s: %s", caller, e)
-        return json.dumps({"success": False, "error": f"Failed to write log: {e}"})
-
-    # Also log to monitoring
-    monitor_db.log_event(caller, "agent_log", data={"entry": entry})
-    _broadcast("log_changes", {
+    # Single destination: the team-scoped decision table. The last 20 entries are
+    # injected into every agent's prompt each turn (compose_live_context), so there
+    # is no file to write — this replaces the old agent_log.md / log_changes trail.
+    monitor_db.log_decision(caller, one_line, team_id=team_id)
+    log.info("[log_decision] %s: %s", caller, one_line[:120])
+    _broadcast("decision_logged", {
         "agent_name": caller,
-        "entry": entry,
+        "team_id": team_id,
+        "decision": one_line,
         "timestamp": time.time(),
     })
 
-    return json.dumps({"success": True, "message": "Log entry recorded."})
+    return json.dumps({"success": True, "message": "Decision recorded."})
+
+
+def _log_action_handler(args: dict, **kwargs) -> str:
+    import time
+
+    action_type = (args.get("action_type") or "").strip()
+    key = (args.get("idempotency_key") or "").strip()
+    target = (args.get("target") or "").strip()
+    outcome = (args.get("outcome") or "").strip()
+    verified = bool(args.get("verified"))
+    task_id_arg = kwargs.get("task_id", "")
+    caller = "unknown"
+    if task_id_arg and task_id_arg.startswith("agent_name:"):
+        caller = task_id_arg.split(":", 1)[1]
+    if not action_type or not key:
+        return json.dumps({"success": False, "error": "action_type and idempotency_key are required."})
+
+    from swarm_server.config import load_agents_config
+    cfg = load_agents_config()
+    team_id = cfg["agents"].get(caller, {}).get("team_id", "default")
+
+    res = monitor_db.record_action(caller, action_type, key, target=target,
+                                   outcome=outcome, verified=verified, team_id=team_id)
+    if res.get("duplicate"):
+        ex = res.get("existing") or {}
+        log.info("[log_action] %s DUP key=%s (already by %s)", caller, key, ex.get("agent_name"))
+        return json.dumps({
+            "success": True, "duplicate": True,
+            "message": (
+                f"ALREADY DONE — '{action_type}' with key '{key}' was recorded by "
+                f"{ex.get('agent_name')} (outcome: {ex.get('outcome') or 'n/a'}). "
+                f"Do NOT repeat it."
+            ),
+            "existing": {"agent_name": ex.get("agent_name"), "outcome": ex.get("outcome"),
+                         "verified": bool(ex.get("verified"))},
+        })
+    log.info("[log_action] %s recorded %s key=%s verified=%s", caller, action_type, key, verified)
+    _broadcast("action_logged", {
+        "agent_name": caller, "team_id": team_id, "action_type": action_type,
+        "target": target, "verified": verified, "timestamp": time.time(),
+    })
+    return json.dumps({
+        "success": True, "duplicate": False,
+        "message": f"Claim recorded for '{action_type}' (key '{key}'). You may proceed.",
+    })
 
 
 def _caller_from_kwargs(kwargs: dict) -> str:
@@ -1024,15 +1172,24 @@ def _register_custom_tools():
                 description="Hand the live browser to a human for a login/CAPTCHA/verification step.",
             )
             log.info("[request_human_takeover] Registered")
-        if "log_changes" not in (registry.get_tool_to_toolset_map() or {}):
+        if "log_decision" not in (registry.get_tool_to_toolset_map() or {}):
             registry.register(
-                name="log_changes",
+                name="log_decision",
                 toolset="custom",
-                schema=_LOG_CHANGES_TOOL_SCHEMA["function"],
-                handler=_log_changes_handler,
-                description="Log important events to the shared team activity log.",
+                schema=_LOG_DECISION_TOOL_SCHEMA["function"],
+                handler=_log_decision_handler,
+                description="Append one significant decision to the shared decision log.",
             )
-            log.info("[log_changes] Registered")
+            log.info("[log_decision] Registered")
+        if "log_action" not in (registry.get_tool_to_toolset_map() or {}):
+            registry.register(
+                name="log_action",
+                toolset="custom",
+                schema=_LOG_ACTION_TOOL_SCHEMA["function"],
+                handler=_log_action_handler,
+                description="Claim/record a side-effecting action with an idempotency key.",
+            )
+            log.info("[log_action] Registered")
         if "get_self_config" not in (registry.get_tool_to_toolset_map() or {}):
             registry.register(
                 name="get_self_config",

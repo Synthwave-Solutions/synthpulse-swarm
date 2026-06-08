@@ -81,7 +81,7 @@ async def _periodic_digest():
     event loop is never blocked. A small semaphore bounds concurrent summary
     calls so a big team can't fan out into a thundering herd on the cheap model.
     """
-    from swarm_server.summarizer import maybe_digest
+    from swarm_server.summarizer import maybe_digest, maybe_rollup_decisions
 
     sem = asyncio.Semaphore(3)
 
@@ -101,8 +101,48 @@ async def _periodic_digest():
             ]
             if jobs:
                 await asyncio.gather(*jobs, return_exceptions=True)
+            # Decision-log rollup (long-term memory): once per team per sweep,
+            # summarize decisions that have scrolled past the live window.
+            teams = {(d.cfg or {}).get("team_id") for d in daemons.values()}
+            for tid in teams:
+                if tid:
+                    try:
+                        await asyncio.to_thread(maybe_rollup_decisions, tid)
+                    except Exception as e:
+                        log.warning("[Rollup] %s failed: %s", tid, e)
         except Exception as e:
             log.warning("[Digest] sweep error: %s", e)
+
+
+async def _periodic_loop_detector():
+    """Layer-5: scan each team's message graph for cross-agent loops / stalls and
+    nudge to break them (see loop_detector.scan_team). Runs in a worker thread —
+    the scan is pure SQLite reads + cheap string work, no LLM call."""
+    from swarm_server.config import LOOP_DETECT_ENABLED, LOOP_SWEEP_INTERVAL_SECONDS
+    if not LOOP_DETECT_ENABLED:
+        log.info("[LoopDetector] disabled")
+        return
+    from swarm_server.loop_detector import scan_team
+
+    def _ingest(agent_name: str, from_agent: str, payload: str) -> None:
+        d = daemons.get(agent_name)
+        if d is not None:
+            d.ingest_task(from_agent=from_agent, payload=payload)
+
+    while True:
+        await asyncio.sleep(LOOP_SWEEP_INTERVAL_SECONDS)
+        try:
+            teams: Dict[str, list] = {}
+            for name, d in list(daemons.items()):
+                tid = (d.cfg or {}).get("team_id")
+                if tid:
+                    teams.setdefault(tid, []).append(name)
+            for tid, members in teams.items():
+                if len(members) < 2:
+                    continue
+                await asyncio.to_thread(scan_team, tid, members, _ingest)
+        except Exception as e:
+            log.warning("[LoopDetector] sweep error: %s", e)
 
 
 @asynccontextmanager
@@ -121,6 +161,7 @@ async def lifespan(app: FastAPI):
 
     prune_task = loop.create_task(_periodic_monitoring_prune())
     digest_task = loop.create_task(_periodic_digest())
+    loopdet_task = loop.create_task(_periodic_loop_detector())
     log.info("[Startup] All agents running. LiteLLM at %s", LITELLM_API_BASE)
     log.info("[Startup] Dashboard at http://%s:%s/", SERVER_HOST, SERVER_PORT)
 
@@ -130,6 +171,7 @@ async def lifespan(app: FastAPI):
         # ---- shutdown ----
         prune_task.cancel()
         digest_task.cancel()
+        loopdet_task.cancel()
         for name, daemon in list(daemons.items()):
             _stop_daemon(daemon)
         # Stop per-team browsers (their on-disk profiles persist for next run).

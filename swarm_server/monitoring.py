@@ -58,12 +58,66 @@ class MonitoringDB:
         model            TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS decisions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   REAL    NOT NULL,
+        agent_name  TEXT    NOT NULL,
+        team_id     TEXT,
+        decision    TEXT    NOT NULL
+    );
+
+    -- Correlation ledger for typed messages: every TASK/QUESTION opens a row,
+    -- the matching RESULT (reply_to) answers it. Lets the system see what work
+    -- is outstanding without anyone polling, and feeds the loop detector.
+    CREATE TABLE IF NOT EXISTS delegations (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id       TEXT    NOT NULL,
+        timestamp    REAL    NOT NULL,
+        from_agent   TEXT    NOT NULL,
+        to_agent     TEXT    NOT NULL,
+        team_id      TEXT,
+        kind         TEXT    NOT NULL,
+        summary      TEXT,
+        status       TEXT    NOT NULL DEFAULT 'open',
+        answered_at  REAL,
+        reply_to     TEXT
+    );
+
+    -- Audit trail of side-effecting actions (deploy, email, publish, payment …)
+    -- keyed by an idempotency_key so two agents cannot double-do the same thing.
+    CREATE TABLE IF NOT EXISTS actions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       REAL    NOT NULL,
+        agent_name      TEXT    NOT NULL,
+        team_id         TEXT,
+        action_type     TEXT    NOT NULL,
+        target          TEXT,
+        idempotency_key TEXT    NOT NULL,
+        outcome         TEXT,
+        verified        INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Rolled-up summaries of old decisions so long-term team memory isn't lost
+    -- when entries scroll past the injected window.
+    CREATE TABLE IF NOT EXISTS milestones (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp           REAL    NOT NULL,
+        team_id             TEXT,
+        summary             TEXT    NOT NULL,
+        covers_to_decision  INTEGER
+    );
+
     CREATE INDEX IF NOT EXISTS idx_events_agent     ON events(agent_name);
     CREATE INDEX IF NOT EXISTS idx_events_time      ON events(timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_events_type      ON events(event_type);
     CREATE INDEX IF NOT EXISTS idx_messages_agent   ON messages(agent_name);
     CREATE INDEX IF NOT EXISTS idx_messages_time    ON messages(timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_digests_agent    ON digests(agent_name, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_decisions_team   ON decisions(team_id, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_deleg_team       ON delegations(team_id, status, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_deleg_msg        ON delegations(msg_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_key ON actions(team_id, idempotency_key);
+    CREATE INDEX IF NOT EXISTS idx_milestones_team  ON milestones(team_id, timestamp DESC);
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -169,6 +223,54 @@ class MonitoringDB:
                 conn.commit()
         except Exception as e:
             log.warning("[MonitorDB] Failed to log message: %s", e)
+
+    def log_decision(self, agent_name: str, decision: str, team_id: str = None) -> None:
+        """Append a one-line decision to the shared, team-scoped decision log.
+
+        This is the durable team memory that replaces the old agent_log.md /
+        log_changes file trail: the last N entries are injected into every
+        agent's prompt each turn (see prompts.compose_live_context), so a
+        decision recorded here is visible team-wide without anyone reading a
+        file. Entries are append-only and never edited."""
+        # Collapse to a single line — the whole point of the decision log is a
+        # scannable one-liner per entry; newlines would break the injected view.
+        one_line = " ".join((decision or "").split()).strip()
+        if not one_line:
+            return
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO decisions (timestamp, agent_name, team_id, decision) "
+                    "VALUES (?, ?, ?, ?)",
+                    (time.time(), agent_name, team_id, one_line[:500]),
+                )
+                conn.commit()
+        except Exception as e:
+            log.warning("[MonitorDB] Failed to log decision: %s", e)
+
+    def get_recent_decisions(self, team_id: str = None, limit: int = 20) -> List[dict]:
+        """Return the most recent decisions (newest first) for prompt injection.
+
+        Scoped by team_id when given. Each row: {timestamp, agent_name, decision}."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                if team_id:
+                    rows = conn.execute(
+                        "SELECT timestamp, agent_name, decision FROM decisions "
+                        "WHERE team_id = ? ORDER BY timestamp DESC LIMIT ?",
+                        (team_id, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT timestamp, agent_name, decision FROM decisions "
+                        "ORDER BY timestamp DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("[MonitorDB] Failed to read decisions: %s", e)
+            return []
 
     def get_events(
         self,
@@ -360,6 +462,169 @@ class MonitoringDB:
         except Exception as e:
             log.warning("[MonitorDB] Prune failed: %s", e)
         return deleted
+
+    # ---- Delegation correlation (typed messages: TASK/QUESTION -> RESULT) ----
+    def open_delegation(self, msg_id: str, from_agent: str, to_agent: str,
+                        kind: str, summary: str = "", team_id: str = None) -> None:
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO delegations (msg_id, timestamp, from_agent, to_agent, "
+                    "team_id, kind, summary, status) VALUES (?,?,?,?,?,?,?, 'open')",
+                    (msg_id, time.time(), from_agent, to_agent, team_id, kind,
+                     (summary or "")[:200]),
+                )
+                conn.commit()
+        except Exception as e:
+            log.warning("[MonitorDB] open_delegation failed: %s", e)
+
+    def answer_delegation(self, reply_to_msg_id: str, by_agent: str = None) -> bool:
+        """Mark the open delegation with msg_id == reply_to as answered. Returns
+        True if a matching open row was closed."""
+        if not reply_to_msg_id:
+            return False
+        try:
+            with self._conn() as conn:
+                cur = conn.execute(
+                    "UPDATE delegations SET status='answered', answered_at=? "
+                    "WHERE msg_id=? AND status='open'",
+                    (time.time(), reply_to_msg_id),
+                )
+                conn.commit()
+                return (cur.rowcount or 0) > 0
+        except Exception as e:
+            log.warning("[MonitorDB] answer_delegation failed: %s", e)
+            return False
+
+    def get_open_delegations(self, to_agent: str = None, from_agent: str = None,
+                             team_id: str = None, limit: int = 50) -> List[dict]:
+        """Outstanding TASK/QUESTION delegations (status='open'), newest first."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                sql = "SELECT * FROM delegations WHERE status='open'"
+                params: list = []
+                if team_id:
+                    sql += " AND team_id = ?"; params.append(team_id)
+                if to_agent:
+                    sql += " AND to_agent = ?"; params.append(to_agent)
+                if from_agent:
+                    sql += " AND from_agent = ?"; params.append(from_agent)
+                sql += " ORDER BY timestamp DESC LIMIT ?"; params.append(limit)
+                return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+        except Exception as e:
+            log.warning("[MonitorDB] get_open_delegations failed: %s", e)
+            return []
+
+    # ---- Action audit log + idempotency ----
+    def record_action(self, agent_name: str, action_type: str, idempotency_key: str,
+                      target: str = "", outcome: str = "", verified: bool = False,
+                      team_id: str = None) -> Dict[str, Any]:
+        """Record a side-effecting action. Idempotent on (team_id, key): if the
+        key already exists this records NOTHING and returns the prior row so the
+        caller can skip the duplicate. Returns {duplicate: bool, existing|recorded}."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                prior = conn.execute(
+                    "SELECT * FROM actions WHERE team_id IS ? AND idempotency_key = ?",
+                    (team_id, idempotency_key),
+                ).fetchone()
+                if prior:
+                    return {"duplicate": True, "existing": dict(prior)}
+                conn.execute(
+                    "INSERT INTO actions (timestamp, agent_name, team_id, action_type, "
+                    "target, idempotency_key, outcome, verified) VALUES (?,?,?,?,?,?,?,?)",
+                    (time.time(), agent_name, team_id, action_type, (target or "")[:300],
+                     idempotency_key, (outcome or "")[:500], 1 if verified else 0),
+                )
+                conn.commit()
+                return {"duplicate": False, "recorded": True}
+        except Exception as e:
+            log.warning("[MonitorDB] record_action failed: %s", e)
+            return {"duplicate": False, "recorded": False, "error": str(e)}
+
+    def get_events_since(self, event_type: str, since_ts: float,
+                         limit: int = 1000) -> List[dict]:
+        """Events of one type newer than since_ts, newest first. Used by the loop
+        detector so a flood of other event types can't push message_sent rows out
+        of a fixed-size get_events() page."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE event_type = ? AND timestamp >= ? "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (event_type, since_ts, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("[MonitorDB] get_events_since failed: %s", e)
+            return []
+
+    def count_actions_since(self, team_id: str, since_ts: float) -> int:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM actions WHERE team_id IS ? AND timestamp >= ?",
+                    (team_id, since_ts),
+                ).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def count_decisions_since(self, team_id: str, since_ts: float) -> int:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM decisions WHERE team_id IS ? AND timestamp >= ?",
+                    (team_id, since_ts),
+                ).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
+    # ---- Decision-log rollup (long-term memory) ----
+    def get_decisions_after(self, team_id: str, after_id: int = 0,
+                            limit: int = 1000) -> List[dict]:
+        """Decisions with id > after_id, OLDEST first (for rollup batching)."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id, timestamp, agent_name, decision FROM decisions "
+                    "WHERE team_id IS ? AND id > ? ORDER BY id ASC LIMIT ?",
+                    (team_id, after_id, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("[MonitorDB] get_decisions_after failed: %s", e)
+            return []
+
+    def save_milestone(self, team_id: str, summary: str, covers_to_decision: int) -> None:
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO milestones (timestamp, team_id, summary, covers_to_decision) "
+                    "VALUES (?,?,?,?)",
+                    (time.time(), team_id, summary, covers_to_decision),
+                )
+                conn.commit()
+        except Exception as e:
+            log.warning("[MonitorDB] save_milestone failed: %s", e)
+
+    def get_latest_milestone(self, team_id: str) -> Optional[dict]:
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                r = conn.execute(
+                    "SELECT * FROM milestones WHERE team_id IS ? "
+                    "ORDER BY timestamp DESC LIMIT 1", (team_id,),
+                ).fetchone()
+                return dict(r) if r else None
+        except Exception as e:
+            log.warning("[MonitorDB] get_latest_milestone failed: %s", e)
+            return None
 
     def get_agent_stats(self, team_id: Optional[str] = None) -> Dict[str, dict]:
         stats = {}

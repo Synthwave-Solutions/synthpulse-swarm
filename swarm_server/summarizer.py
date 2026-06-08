@@ -245,6 +245,80 @@ def summarize_agent(
     return record
 
 
+_ROLLUP_SYSTEM_PROMPT = (
+    "You compress a batch of a team's chronological DECISION-LOG entries into one "
+    "compact 'milestone' summary for long-term memory. Capture: what was decided, "
+    "what shipped/was verified, the current state, and any standing blockers. Be "
+    "factual and specific; preserve concrete facts (URLs, modes, names, numbers). "
+    "No preamble, no markdown — return 2-4 plain sentences, <=120 words."
+)
+
+
+def maybe_rollup_decisions(team_id: str) -> Optional[dict]:
+    """Summarize a team's oldest un-rolled decisions into a milestone once they
+    scroll past the live window, so memory older than the injected last-N isn't
+    lost. Idempotent and cheap: a single read gates the LLM call.
+
+    Keeps the most recent DECISION_LIVE_WINDOW decisions live (un-rolled) and only
+    acts once at least DECISION_ROLLUP_TRIGGER have accumulated beyond the last
+    milestone."""
+    from swarm_server.config import DECISION_LIVE_WINDOW, DECISION_ROLLUP_TRIGGER
+
+    last = monitor_db.get_latest_milestone(team_id)
+    after_id = int((last or {}).get("covers_to_decision") or 0)
+    unrolled = monitor_db.get_decisions_after(team_id, after_id, limit=1000)  # oldest first
+    if len(unrolled) < DECISION_ROLLUP_TRIGGER:
+        return None  # not enough beyond the live window yet
+
+    # Roll everything except the most-recent live window; keep that live.
+    to_roll = unrolled[:-DECISION_LIVE_WINDOW] if DECISION_LIVE_WINDOW > 0 else unrolled
+    if not to_roll:
+        return None
+    covers_to = int(to_roll[-1]["id"])
+
+    lines = []
+    for d in to_roll:
+        stamp = ""
+        try:
+            from datetime import datetime
+            stamp = datetime.fromtimestamp(d.get("timestamp", 0)).strftime("%m-%d %H:%M")
+        except Exception:
+            pass
+        lines.append(f"[{stamp}] {d.get('agent_name')}: {d.get('decision')}")
+    batch = "\n".join(lines)
+
+    prior = (last or {}).get("summary") or "(none)"
+    target = _resolve_summary_target()
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=target["base_url"], api_key=target["api_key"],
+                        timeout=60.0, max_retries=1)
+        resp = client.chat.completions.create(
+            model=target["model"],
+            messages=[
+                {"role": "system", "content": _ROLLUP_SYSTEM_PROMPT},
+                {"role": "user", "content": (
+                    f"PRIOR MILESTONE (context, do not repeat verbatim):\n{prior}\n\n"
+                    f"NEW DECISIONS TO ROLL UP ({len(to_roll)} entries, oldest first):\n{batch}\n\n"
+                    "Write the updated milestone summary.")},
+            ],
+            temperature=0.2,
+            max_tokens=300,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.warning("[Rollup] LLM call failed for team %s: %s", team_id, e)
+        return None
+    if not summary:
+        return None
+
+    monitor_db.save_milestone(team_id, summary, covers_to_decision=covers_to)
+    log.info("[Rollup] team %s: rolled %d decisions into milestone (covers_to=%d)",
+             team_id, len(to_roll), covers_to)
+    return {"team_id": team_id, "rolled": len(to_roll), "covers_to": covers_to,
+            "summary": summary}
+
+
 def maybe_digest(agent_name: str, team_id: Optional[str] = None) -> Optional[dict]:
     """Hybrid trigger: summarize iff there's new activity AND (enough new
     volume OR enough time elapsed since the last digest). Idle agents cost a
