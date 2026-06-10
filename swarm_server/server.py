@@ -319,21 +319,38 @@ async def agent_digests(agent_name: str, limit: int = 50):
 @app.get("/settings")
 async def get_settings():
     """Global swarm settings (e.g. the digest summary model + on/off)."""
-    return JSONResponse(get_global_settings())
+    from swarm_server.config import VISION_MODEL
+
+    out = dict(get_global_settings())
+    # What "" falls back to — lets the UI show the real default as placeholder.
+    out["vision_model_default"] = VISION_MODEL
+    return JSONResponse(out)
 
 
 @app.post("/settings")
 async def post_settings(request: Request):
-    """Patch global swarm settings. Recognized keys: summary_model, digest_enabled."""
+    """Patch global swarm settings. Recognized keys: summary_model,
+    digest_enabled, vision_model."""
     body = await request.json()
     fields = {}
     if "summary_model" in body:
         fields["summary_model"] = body.get("summary_model")
     if "digest_enabled" in body:
         fields["digest_enabled"] = body.get("digest_enabled")
+    if "vision_model" in body:
+        fields["vision_model"] = body.get("vision_model")
     if not fields:
         return JSONResponse({"error": "no recognized settings keys"}, status_code=400)
+    before_vision = (get_global_settings().get("vision_model") or "").strip()
     settings = update_global_settings(fields)
+    # The vision model is baked into each agent's auxiliary.vision config —
+    # re-init agents so browser_vision/browser_locate pick it up next turn.
+    if "vision_model" in fields and (settings.get("vision_model") or "").strip() != before_vision:
+        for name in list(daemons.keys()):
+            try:
+                _update_daemon_cfg(name, load_agents_config()["agents"].get(name, daemons[name].cfg))
+            except Exception as e:
+                log.warning("vision_model re-init failed for %s: %s", name, e)
     from swarm_server.websocket import _broadcast
 
     _broadcast("settings_updated", settings)
@@ -567,12 +584,12 @@ _EDITABLE_AGENT_FIELDS = {
     "name", "model", "provider", "autonomous", "sweep_interval", "heartbeat_seconds",
     "temperature", "max_tokens", "reasoning_effort", "max_iterations",
     "enabled_toolsets", "disabled_toolsets", "compression_threshold", "role_soul",
-    "is_supervisor", "supervisor_token_threshold", "context_isolated",
+    "is_supervisor", "supervisor_interval_minutes", "context_isolated",
 }
 # Numeric fields where an empty value means "clear → use the default".
 _NUMERIC_CLEARABLE = (
     "sweep_interval", "heartbeat_seconds", "temperature", "max_tokens",
-    "max_iterations", "compression_threshold", "supervisor_token_threshold",
+    "max_iterations", "compression_threshold", "supervisor_interval_minutes",
 )
 
 
@@ -715,7 +732,7 @@ async def get_agent_config(agent_name: str):
         "role_soul": a.get("role_soul") or a.get("soul") or "",
         "allowed_peers": a.get("allowed_peers", []),
         "is_supervisor": bool(a.get("is_supervisor", False)),
-        "supervisor_token_threshold": a.get("supervisor_token_threshold"),
+        "supervisor_interval_minutes": a.get("supervisor_interval_minutes"),
         "hermes_home": str(getattr(daemon, "_hermes_home", "")) if daemon else "",
         "telemetry": telemetry,
     })

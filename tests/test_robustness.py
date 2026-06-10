@@ -40,7 +40,7 @@ from swarm_server.prompts import (  # noqa: E402
     SELF_LOOP_NUDGE,
     STALE_CONTEXT_NOTE,
     SUPERVISOR_DEFAULT_SOUL,
-    SUPERVISOR_FEED_PROMPT,
+    SUPERVISOR_SWEEP_PROMPT,
     TEXT_ONLY_TURN_NUDGE,
     compose_agent_soul,
     strip_stale_live_context,
@@ -220,7 +220,7 @@ def test_framework_prompts_are_mission_neutral():
     banned = ("paying customer", "revenue", "north star", "marketing email",
               "linkedin", "customer-facing")
     for blob in (COMMON_SOUL_TEMPLATE, AUTONOMOUS_HEARTBEAT_PROMPT,
-                 CRON_WAKEUP_PROMPT, SUPERVISOR_FEED_PROMPT,
+                 CRON_WAKEUP_PROMPT, SUPERVISOR_SWEEP_PROMPT,
                  SUPERVISOR_DEFAULT_SOUL, TEXT_ONLY_TURN_NUDGE, SELF_LOOP_NUDGE):
         low = blob.lower()
         for phrase in banned:

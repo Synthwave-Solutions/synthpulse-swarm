@@ -28,7 +28,9 @@ from swarm_server.config import (
     SELF_LOOP_REPEATS,
     SELF_LOOP_WINDOW,
     SUPERVISOR_FEED_CHAR_CAP,
-    SUPERVISOR_TOKEN_THRESHOLD,
+    SUPERVISOR_SWEEP_CHAR_CAP,
+    SUPERVISOR_SWEEP_INTERVAL_MINUTES,
+    SUPERVISOR_SWEEP_PER_PEER_FLOOR,
     SWEEP_INTERVAL_SECONDS,
     _derive_workspace_path,
     _ensure_project_dir,
@@ -40,7 +42,7 @@ from swarm_server.prompts import (
     AUTONOMOUS_HEARTBEAT_PROMPT,
     CRON_WAKEUP_PROMPT,
     SELF_LOOP_NUDGE,
-    SUPERVISOR_FEED_PROMPT,
+    SUPERVISOR_SWEEP_PROMPT,
     TEXT_ONLY_TURN_NUDGE,
     compose_agent_soul,
     compose_live_context,
@@ -70,7 +72,7 @@ AGENT_STATE_PAUSED = "paused"
 # heartbeat backoff.
 _SYSTEM_SENDERS = frozenset(
     {"autonomous", "cron", "turn-guard", "self-loop-guard", "supervisor-feed",
-     "loop_detector"}
+     "supervisor-sweep", "loop_detector"}
 )
 
 
@@ -118,6 +120,52 @@ def detect_repeated_signature(
         if c >= repeats and c > best_n:
             best, best_n = s, c
     return best
+
+def _age_short(seconds: float) -> str:
+    """'47m' / '3h12m' — compact age for supervisor-sweep ledger lines."""
+    s = int(max(0, seconds))
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def compose_sweep_sections(peer_data: List[Dict[str, Any]], char_cap: int,
+                           per_peer_floor: int) -> str:
+    """Render the per-agent sections of a supervisor sweep.
+
+    ``peer_data``: one dict per linked peer — {peer, state, pending, transcript,
+    signal, messages, tokens}. The total char budget is split across the peers
+    that were ACTIVE this window (each keeps its most-recent slice, truncation
+    marked); silent peers cost a header line and are reported explicitly, so
+    silence-while-owing-work is visible instead of missing. Pure function —
+    unit-testable without a daemon.
+    """
+    active = [d for d in peer_data if d.get("transcript")]
+    slice_cap = max(per_peer_floor, char_cap // max(1, len(active)))
+    out = []
+    for d in peer_data:
+        state = (d.get("state") or "?").upper()
+        if not d.get("transcript"):
+            queued = " — but it HAS queued work waiting" if d.get("pending") else ""
+            out.append(
+                f"=== {d['peer']} — NO ACTIVITY this window [{state}]{queued} ===\n"
+                "(nothing since your last sweep — if the LEDGER shows it owes an "
+                "open delegation, that silence IS the finding)"
+            )
+            continue
+        text = d["transcript"]
+        if len(text) > slice_cap:
+            text = ("[…older activity in this window truncated…]\n\n"
+                    + text[-slice_cap:])
+        mid_turn = (" [BUSY — may be MID-TURN; its partial turn so far is included]"
+                    if state == AGENT_STATE_BUSY.upper() else f" [{state}]")
+        out.append(
+            f"=== {d['peer']} — {d.get('messages', 0)} message(s), "
+            f"~{d.get('tokens', 0)} tokens this window{mid_turn} ===\n"
+            f"{d.get('signal') or ''}\n\n{text}"
+        )
+    return "\n\n".join(out)
+
 
 def _ensure_hermes_on_path() -> None:
     """Make the Hermes package importable (pip install / PYTHONPATH / checkout).
@@ -256,10 +304,14 @@ class AgentDaemon:
         # the transcript only when it actually changes (not on every turn).
         self._last_sysctx_hash: Optional[int] = None
         # Supervisor agents only: per-linked-peer high-water mark (last monitoring
-        # message id already fed for review). Lazy-initialized to the peer's
-        # current latest id, so a supervisor reviews NEW activity only and never
+        # message id already covered by a sweep). Lazy-initialized to the peer's
+        # current latest id, so a supervisor covers NEW activity only and never
         # gets a peer's entire backlog dumped into its queue at once.
         self._sup_watermark: Dict[str, int] = {}
+        # Supervisor sweep clock: the interval-sweep mechanism replaces the old
+        # token-threshold reviews. Seeded to "now" so the first sweep covers
+        # daemon-start → first tick, never history.
+        self._last_sweep_ts = time.time()
         # Idle-heartbeat backoff: consecutive heartbeat turns that produced no
         # concrete action. Effective interval = base * 2**min(misses, cap), so a
         # genuinely-idle 24/7 agent costs exponentially less instead of burning
@@ -627,6 +679,20 @@ class AgentDaemon:
                         self._ai_agent.tools = list(self._ai_agent.tools or [])
                         self._ai_agent.tools.append(_RESUME_AGENT_TOOL_SCHEMA)
                         self._ai_agent.valid_tool_names.add("resume_agent")
+
+                # GUI-grade browser tools (keys/hover/drag/click_xy/screenshot/
+                # locate). Only where the Hermes browser toolset itself is live
+                # (browser_navigate present) — they drive the same session — and
+                # NEVER for supervisors, whose browser access is stripped.
+                if (not self.cfg.get("is_supervisor")
+                        and "browser_navigate" in existing_names):
+                    from swarm_server.browser_gui_tools import GUI_BROWSER_TOOL_SCHEMAS
+                    for _gui_schema in GUI_BROWSER_TOOL_SCHEMAS:
+                        _gui_name = _gui_schema["function"]["name"]
+                        if _gui_name not in existing_names and _gui_name not in disabled:
+                            self._ai_agent.tools = list(self._ai_agent.tools or [])
+                            self._ai_agent.tools.append(_gui_schema)
+                            self._ai_agent.valid_tool_names.add(_gui_name)
 
                 # Force tool-use enforcement guidance — agents must end their turn
                 # with a tool call (send_peer_message / ask_human) rather than
@@ -1058,15 +1124,18 @@ class AgentDaemon:
         base * 2**misses, capped at 2**HEARTBEAT_BACKOFF_MAX_DOUBLINGS."""
         return float(base) * (2 ** min(max(0, int(misses)), HEARTBEAT_BACKOFF_MAX_DOUBLINGS))
 
-    def _supervisor_threshold(self) -> int:
-        """New-token threshold before a linked peer's activity is fed for review."""
+    def _supervisor_interval_seconds(self) -> int:
+        """Sweep cadence: per-agent `supervisor_interval_minutes` (agent
+        settings) over the global default; floored at 2 minutes."""
         try:
-            v = int(self.cfg.get("supervisor_token_threshold") or 0)
-            return v if v > 0 else SUPERVISOR_TOKEN_THRESHOLD
+            v = float(self.cfg.get("supervisor_interval_minutes") or 0)
         except (TypeError, ValueError):
-            return SUPERVISOR_TOKEN_THRESHOLD
+            v = 0
+        minutes = v if v > 0 else SUPERVISOR_SWEEP_INTERVAL_MINUTES
+        return max(120, int(minutes * 60))
 
-    def _render_feed_transcript(self, msgs: List[Dict[str, Any]]) -> str:
+    def _render_feed_transcript(self, msgs: List[Dict[str, Any]],
+                                char_cap: int = SUPERVISOR_FEED_CHAR_CAP) -> str:
         """Render a peer's new messages oldest-first, capped to the most-recent
         slice (a marker notes any truncation — no silent loss)."""
         lines = []
@@ -1076,9 +1145,9 @@ class AgentDaemon:
             if content:
                 lines.append(f"[{role}] {content}")
         text = "\n\n".join(lines)
-        if len(text) > SUPERVISOR_FEED_CHAR_CAP:
+        if len(text) > char_cap:
             text = ("[…older activity in this window truncated…]\n\n"
-                    + text[-SUPERVISOR_FEED_CHAR_CAP:])
+                    + text[-char_cap:])
         return text
 
     # Tool calls that do NOT advance the mission by themselves — coordination and
@@ -1181,14 +1250,82 @@ class AgentDaemon:
             pass
         return "\n".join(parts)
 
+    def _peer_runtime_state(self, peer: str) -> tuple:
+        """(state, pending_count) for a linked peer — live from its daemon."""
+        try:
+            daemon = _daemon_registry.get(peer)
+            if daemon is not None:
+                pending = 0
+                try:
+                    pending = daemon.queue.get_pending_count()
+                except Exception:
+                    pass
+                return (getattr(daemon, "state", None) or "?", pending)
+        except Exception:
+            pass
+        return ("?", 0)
+
+    def _sweep_ledger(self, peers: List[str],
+                      by_peer: Dict[str, Dict[str, Any]], now: float) -> str:
+        """Compact team-state header for a sweep: agent states, open
+        delegations involving the watched agents (with ages + overdue flags),
+        and pending human questions. Scoped to THIS supervisor's peers — a
+        team can run several supervisors over different subsets."""
+        bits = []
+        for p in peers:
+            d = by_peer.get(p, {})
+            state = (d.get("state") or "?").upper()
+            q = d.get("pending") or 0
+            bits.append(f"{p}: {state}" + (f" ({q} queued)" if q else ""))
+        lines = ["Agents — " + " · ".join(bits)]
+        try:
+            dels = monitor_db.get_open_delegations(
+                team_id=self.cfg.get("team_id"), limit=30)
+        except Exception:
+            dels = []
+        mine = [d for d in dels
+                if d.get("to_agent") in peers or d.get("from_agent") in peers]
+        if mine:
+            for d in mine[:10]:
+                age = max(0.0, now - float(d.get("timestamp") or now))
+                flag = (" ⚠ overdue — chase the owner or reassign"
+                        if age > 7200 else "")
+                lines.append(
+                    f"OPEN [{(d.get('msg_id') or '')[:8]}] "
+                    f"{d.get('from_agent')}→{d.get('to_agent')} "
+                    f"open {_age_short(age)}{flag}: "
+                    f"{(d.get('summary') or '').strip()[:80]}")
+        else:
+            lines.append("Open delegations involving your agents: none")
+        try:
+            from swarm_server.tools import get_pending_questions
+
+            qs = [q for q in get_pending_questions()
+                  if q.get("status") == "pending" and q.get("agent_name") in peers]
+            for q in qs[:5]:
+                age = max(0.0, now - float(q.get("timestamp") or now))
+                lines.append(
+                    f"WAITING ON HUMAN {_age_short(age)} — {q.get('agent_name')}: "
+                    f"{(q.get('question') or '').strip()[:90]}")
+        except Exception:
+            pass
+        return "\n".join(lines)
+
     def _maybe_feed_supervisor(self) -> None:
-        """Supervisor agents only: push each linked peer's recent transcript into
-        THIS agent's own queue once the peer accrues enough new activity.
+        """Supervisor agents only: every sweep interval, push ONE task into
+        THIS agent's own queue carrying everything every linked peer did since
+        the previous sweep — straight from the live monitoring DB, so an agent
+        mid-turn contributes its partial turn up to this moment — plus a team
+        ledger (states, open delegations with ages, human blocks).
 
         Daemon-side and automatic — the supervisor never calls a tool to fetch;
-        the review simply arrives as a queued task, like any peer message. One
-        feed per tick (others follow on later ticks) and only while not busy /
-        not backed up, so reviews don't pile up.
+        the sweep arrives as a queued task, like any peer message. Replaces the
+        retired token-threshold reviews, which were volume-gated, single-peer,
+        and silence-blind (an idle agent owing work never generated tokens, so
+        it was never reviewed). Interval: per-agent `supervisor_interval_minutes`
+        over SUPERVISOR_SWEEP_INTERVAL_MINUTES. If the supervisor is busy when
+        the interval elapses, the sweep fires on the next idle tick and the
+        window simply covers the longer span — watermarks keep it gapless.
         """
         if not self.cfg.get("is_supervisor") or self._stop_requested:
             return
@@ -1196,55 +1333,66 @@ class AgentDaemon:
             return
         try:
             if self.queue.get_pending_count() > 0:
-                return  # already has a review (or other task) queued — wait
+                return  # a sweep (or other task) is already waiting — never pile up
         except Exception:
             return
-        peers = self.cfg.get("allowed_peers") or []
-        threshold = self._supervisor_threshold()
-        # Gather every peer with a reviewable backlog, then feed the one with the
-        # MOST unreviewed activity. Feeding the first qualifier in list order (and
-        # returning) let chatty peers early in allowed_peers permanently starve a
-        # busy/looping peer later in the list — so the agent most likely in trouble
-        # (it generates the most transcript) was the one never reviewed. Picking the
-        # largest backlog both prevents starvation and prioritizes the loudest agent.
-        candidates = []  # (tokens, peer)
-        for peer in peers:
-            try:
-                wm = self._sup_watermark.get(peer)
-                activity = monitor_db.get_new_activity(peer, wm or 0)
-                if wm is None:
-                    # First time watching this peer — start from "now" so we don't
-                    # dump its whole history; review only what happens next.
-                    self._sup_watermark[peer] = activity["max_id"]
-                    continue
-                if activity["count"] <= 0 or activity["tokens"] < threshold:
-                    continue
-                candidates.append((activity["tokens"], peer))
-            except Exception as e:
-                log.debug("[%s] supervisor scan for %s failed: %s", self.name, peer, e)
-        if not candidates:
+        now = time.time()
+        if now - self._last_sweep_ts < self._supervisor_interval_seconds():
             return
-        tokens, peer = max(candidates)  # highest unreviewed token backlog wins
+        peers = [p for p in (self.cfg.get("allowed_peers") or []) if p != self.name]
+        if not peers:
+            self._last_sweep_ts = now
+            return
         try:
-            wm = self._sup_watermark.get(peer)
-            msgs = monitor_db.get_messages_since(peer, wm)
-            if not msgs:
-                return
-            max_id = max(int(m["id"]) for m in msgs)
-            transcript = self._render_feed_transcript(msgs)
-            progress_signal = self._assess_peer_progress(peer, msgs)
-            prompt = SUPERVISOR_FEED_PROMPT.format(
-                peer=peer, tokens=tokens, transcript=transcript,
-                progress_signal=progress_signal,
-            )
-            self._sup_watermark[peer] = max_id
+            peer_data: List[Dict[str, Any]] = []
+            new_marks: Dict[str, int] = {}
+            for peer in peers:
+                wm = self._sup_watermark.get(peer)
+                if wm is None:
+                    # First sight of this peer (fresh daemon or newly linked):
+                    # anchor to its current latest id — this sweep reports it
+                    # honestly as "no activity", the next covers it fully.
+                    # Never dump a peer's entire history.
+                    try:
+                        wm = monitor_db.get_new_activity(peer, 0)["max_id"]
+                    except Exception:
+                        wm = 0
+                    self._sup_watermark[peer] = wm
+                msgs = monitor_db.get_messages_since(peer, wm)
+                new_marks[peer] = max([int(m["id"]) for m in msgs], default=wm)
+                state, pending = self._peer_runtime_state(peer)
+                peer_data.append({
+                    "peer": peer, "state": state, "pending": pending,
+                    # Render uncapped here; compose_sweep_sections owns the
+                    # per-peer budget so one noisy peer can't eat the sweep.
+                    "transcript": (self._render_feed_transcript(
+                        msgs, char_cap=SUPERVISOR_SWEEP_CHAR_CAP) if msgs else ""),
+                    "signal": (self._assess_peer_progress(peer, msgs)
+                               if msgs else ""),
+                    "messages": len(msgs),
+                    "tokens": sum(int(m.get("tokens") or 0) for m in msgs),
+                })
+            ledger = self._sweep_ledger(
+                peers, {d["peer"]: d for d in peer_data}, now)
+            sections = compose_sweep_sections(
+                peer_data, SUPERVISOR_SWEEP_CHAR_CAP, SUPERVISOR_SWEEP_PER_PEER_FLOOR)
+            prompt = SUPERVISOR_SWEEP_PROMPT.format(
+                window_minutes=max(1, round((now - self._last_sweep_ts) / 60)),
+                peer_count=len(peers), ledger=ledger, sections=sections)
             monitor_db.log_event(
-                self.name, "supervisor_feed", to_agent=peer,
-                data={"tokens": tokens, "messages": len(msgs)},
+                self.name, "supervisor_sweep",
+                data={"peers": len(peers),
+                      "active": sum(1 for d in peer_data if d["messages"]),
+                      "chars": len(prompt),
+                      "window_seconds": int(now - self._last_sweep_ts)},
             )
-            self.ingest_task("supervisor-feed", prompt)  # one review per tick
+            self.ingest_task("supervisor-sweep", prompt)
+            # Commit watermarks + clock only after the sweep is safely queued,
+            # so a failure above retries the same window on the next tick.
+            self._sup_watermark.update(new_marks)
+            self._last_sweep_ts = now
         except Exception as e:
-            log.debug("[%s] supervisor feed for %s failed: %s", self.name, peer, e)
+            log.warning("[%s] supervisor sweep failed: %s", self.name, e)
 
     def _maybe_fire_crons(self) -> None:
         """Inject the instruction of any cron wake-up whose time has come.

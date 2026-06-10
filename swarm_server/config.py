@@ -286,7 +286,7 @@ COMPRESSION_HYGIENE_HARD_MESSAGE_LIMIT = 400
 AUTONOMOUS_HEARTBEAT_SECONDS = int(os.environ.get("SWARM_HEARTBEAT_SECONDS", "1800"))
 
 # Prompt/soul construction (AUTONOMOUS_HEARTBEAT_PROMPT, CRON_WAKEUP_PROMPT,
-# SUPERVISOR_FEED_PROMPT, SUPERVISOR_DEFAULT_SOUL, compose_* / _build_* helpers)
+# SUPERVISOR_SWEEP_PROMPT, SUPERVISOR_DEFAULT_SOUL, compose_* / _build_* helpers)
 # lives in swarm_server/prompts.py — the single home for prompt text + assembly.
 
 # ---------------------------------------------------------------------------
@@ -447,18 +447,36 @@ DECISION_ROLLUP_TRIGGER = int(os.environ.get("SWARM_DECISION_ROLLUP_TRIGGER", "4
 # Supervisor agents (Layer 4 observability)
 # ---------------------------------------------------------------------------
 # A supervisor is an ordinary Hermes agent flagged is_supervisor and LINKED to
-# the agents it watches (its allowed_peers). Its one extra behavior is push, not
-# pull: the daemon watches each linked peer's transcript and, once a peer accrues
-# SUPERVISOR_TOKEN_THRESHOLD new tokens since the supervisor last saw it, drops
-# that peer's recent conversation into the supervisor's OWN queue as a task. The
-# supervisor then runs a normal turn and, if the peer is drifting/stuck/looping,
-# steers it with the existing send_peer_message tool. There is NO tool to call —
-# the review is delivered automatically, exactly like any queued message.
+# the agents it watches (its allowed_peers — a team can run several supervisors
+# over different subsets). Its one extra behavior is push, not pull: every
+# sweep interval the daemon assembles EVERYTHING each linked peer did since the
+# previous sweep — straight from the live monitoring DB, so an agent mid-turn
+# contributes its partial turn up to that moment — into ONE task in the
+# supervisor's own queue: a section per peer (silent peers get an explicit
+# "no activity" section) plus a ledger of states, open delegations with ages,
+# and pending human questions. The supervisor then runs a normal turn and
+# steers with send_peer_message / pause_agent. There is NO tool to call — the
+# sweep is delivered automatically, exactly like any queued message.
+#
+# Interval: per-agent `supervisor_interval_minutes` (agent settings), else
+# this default. The old token-threshold trigger (one peer at a time once it
+# accrued SUPERVISOR_TOKEN_THRESHOLD new tokens) is RETIRED — it was volume-
+# gated, single-peer, and silence-blind: an idle agent sitting on an open
+# delegation never generated tokens, so it was never reviewed.
+SUPERVISOR_SWEEP_INTERVAL_MINUTES = float(
+    os.environ.get("SWARM_SUPERVISOR_SWEEP_MINUTES", "20"))
+# Total char budget for one sweep prompt, split across the peers that were
+# active this window (each peer keeps its most-recent slice, truncation noted).
+SUPERVISOR_SWEEP_CHAR_CAP = int(os.environ.get("SWARM_SUPERVISOR_SWEEP_CHAR_CAP", "32000"))
+# Floor for one active peer's slice so a noisy teammate can't starve the rest
+# below readability.
+SUPERVISOR_SWEEP_PER_PEER_FLOOR = int(
+    os.environ.get("SWARM_SUPERVISOR_SWEEP_PER_PEER_FLOOR", "2000"))
+# DEPRECATED — no longer read by the daemon; kept so old .env files don't error.
 SUPERVISOR_TOKEN_THRESHOLD = int(os.environ.get("SWARM_SUPERVISOR_TOKEN_THRESHOLD", "6000"))
-# Cap the transcript fed in one review so a big burst can't blow the supervisor's
-# own context; keep the most-recent slice and note any truncation.
+# Legacy single-review cap; still the default char_cap of _render_feed_transcript.
 SUPERVISOR_FEED_CHAR_CAP = int(os.environ.get("SWARM_SUPERVISOR_FEED_CHAR_CAP", "24000"))
-# SUPERVISOR_FEED_PROMPT and SUPERVISOR_DEFAULT_SOUL live in swarm_server/prompts.py.
+# SUPERVISOR_SWEEP_PROMPT and SUPERVISOR_DEFAULT_SOUL live in swarm_server/prompts.py.
 
 # Human-inbox registry cap (in-memory) — drop oldest resolved questions past this.
 MAX_PENDING_QUESTIONS = 500
@@ -659,7 +677,7 @@ def write_agent_hermes_config(
     # OpenRouter) and fail. Without this entry the "vision" task resolves to
     # provider="auto" and browser_vision raises "No LLM provider configured".
     vision_cfg = dict(aux_endpoint)
-    vision_cfg["model"] = VISION_MODEL
+    vision_cfg["model"] = get_vision_model()
     aux_section["vision"] = {**aux_section.get("vision", {}), **vision_cfg}
     existing["auxiliary"] = aux_section
 
@@ -1181,6 +1199,10 @@ _GLOBAL_SETTINGS_DEFAULTS = {
     # "" => use the swarm default model (DEFAULT_MODEL) for digests.
     "summary_model": SUMMARY_MODEL,
     "digest_enabled": DIGEST_ENABLED_DEFAULT,
+    # Multimodal model for screenshot reading + GUI grounding (browser_vision,
+    # browser_locate). "" => the VISION_MODEL env/code default. UI-settable;
+    # written into every agent's auxiliary.vision config on re-init.
+    "vision_model": "",
 }
 
 
@@ -1203,6 +1225,8 @@ def update_global_settings(fields: Dict[str, Any]) -> Dict[str, Any]:
         settings["summary_model"] = (fields["summary_model"] or "").strip()
     if "digest_enabled" in fields:
         settings["digest_enabled"] = bool(fields["digest_enabled"])
+    if "vision_model" in fields:
+        settings["vision_model"] = (fields["vision_model"] or "").strip()
     cfg["settings"] = settings
     _save_full_config(cfg)
     out = dict(_GLOBAL_SETTINGS_DEFAULTS)
@@ -1210,6 +1234,18 @@ def update_global_settings(fields: Dict[str, Any]) -> Dict[str, Any]:
         if k in settings and settings[k] is not None:
             out[k] = settings[k]
     return out
+
+
+def get_vision_model() -> str:
+    """Effective multimodal model for screenshot reading / GUI grounding:
+    the UI-set global setting, else the VISION_MODEL env/code default."""
+    try:
+        configured = (get_global_settings().get("vision_model") or "").strip()
+        if configured:
+            return configured
+    except Exception:
+        pass
+    return VISION_MODEL
 
 
 def list_agent_crons(cfg: Dict[str, Any], name: str) -> List[Dict[str, Any]]:

@@ -545,6 +545,7 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
                 <div class="control-group"><span class="control-label">Compression threshold (0–1)</span><input class="control-input" id="cfg-compress" type="number" step="0.05" min="0.1" max="0.95" placeholder="default"></div>
                 <div class="control-group"><span class="control-label">Autonomous wake-up every (s)</span><input class="control-input" id="cfg-heartbeat" type="number" min="60" placeholder="default 1800"></div>
             </div>
+            <div class="control-group"><span class="control-label">Supervisor sweep every (min) — supervisors only</span><input class="control-input" id="cfg-supinterval" type="number" min="2" placeholder="default 20"></div>
             <div class="control-group"><span class="control-label">Enabled toolsets (comma; blank = defaults)</span><input class="control-input" id="cfg-entools" list="toolset-list" placeholder="e.g. web, terminal, file, browser"></div>
             <div class="control-group"><span class="control-label">Disabled toolsets (comma)</span><input class="control-input" id="cfg-distools" list="toolset-list" placeholder="e.g. computer_use"></div>
             <datalist id="toolset-list"></datalist>
@@ -585,6 +586,8 @@ input, button, select, textarea { font-family: inherit; letter-spacing: inherit;
             <div class="control-group"><span class="control-label">Monitoring summary model</span><input class="control-input" id="setup-summary-model" list="setup-model-list" placeholder="(defaults to the model above)"></div>
             <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;margin-bottom:6px"><input type="checkbox" id="setup-digest-enabled"> Auto-summarize agent activity into status digests</label>
             <div style="font-size:11px;color:var(--text-muted);line-height:1.5">A cheap out-of-band model reads each agent's activity and writes a short rolling status — monitor a big team by digest instead of reading every chat.</div>
+            <div class="control-group" style="margin-top:12px"><span class="control-label">Vision model (screenshots &amp; GUI grounding)</span><input class="control-input" id="setup-vision-model" list="setup-model-list" placeholder=""></div>
+            <div style="font-size:11px;color:var(--text-muted);line-height:1.5">Multimodal model agents use to read browser screenshots (<code>browser_vision</code>) and find on-screen elements by description (<code>browser_locate</code> → coordinates for <code>browser_click_xy</code>). Must accept image input; served through the same endpoint as the default model. Applies to all agents on save.</div>
             <div id="setup-error" style="color:var(--danger);font-size:11px;margin-top:8px"></div>
         </div>
         <div class="modal-footer">
@@ -1383,6 +1386,7 @@ async function showAgentConfig(name) {
         document.getElementById('cfg-maxtok').value = cfg.max_tokens ?? '';
         document.getElementById('cfg-provider').value = cfg.provider || '';
         document.getElementById('cfg-maxiter').value = cfg.max_iterations ?? '';
+        document.getElementById('cfg-supinterval').value = cfg.supervisor_interval_minutes ?? '';
         document.getElementById('cfg-compress').value = cfg.compression_threshold ?? '';
         document.getElementById('cfg-entools').value = (cfg.enabled_toolsets || []).join(', ');
         document.getElementById('cfg-distools').value = (cfg.disabled_toolsets || []).join(', ');
@@ -1547,6 +1551,7 @@ async function saveAgentConfig() {
         max_tokens: document.getElementById('cfg-maxtok').value.trim(),
         provider: document.getElementById('cfg-provider').value.trim(),
         max_iterations: document.getElementById('cfg-maxiter').value.trim(),
+        supervisor_interval_minutes: document.getElementById('cfg-supinterval').value.trim(),
         compression_threshold: document.getElementById('cfg-compress').value.trim(),
         enabled_toolsets: document.getElementById('cfg-entools').value.trim(),
         disabled_toolsets: document.getElementById('cfg-distools').value.trim(),
@@ -1610,6 +1615,9 @@ async function showModelSettings(firstRun) {
         const s = await fetch(`${API_URL}/settings`).then(r => r.json());
         document.getElementById('setup-summary-model').value = s.summary_model || '';
         document.getElementById('setup-digest-enabled').checked = s.digest_enabled !== false;
+        const vis = document.getElementById('setup-vision-model');
+        vis.value = s.vision_model || '';
+        vis.placeholder = s.vision_model_default ? `(default: ${s.vision_model_default})` : '(multimodal model id)';
     } catch (e) { /* non-fatal */ }
     document.getElementById('modal-setup').classList.add('show');
 }
@@ -1665,6 +1673,7 @@ async function postSetup(body) {
                 body: JSON.stringify({
                     summary_model: document.getElementById('setup-summary-model').value.trim(),
                     digest_enabled: document.getElementById('setup-digest-enabled').checked,
+                    vision_model: document.getElementById('setup-vision-model').value.trim(),
                 }),
             });
         } catch (e) { /* non-fatal */ }

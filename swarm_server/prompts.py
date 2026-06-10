@@ -177,6 +177,22 @@ Starts in {project_dir}. The working directory does NOT persist between calls �
 chain `cd sub && …` or use absolute paths. Long-running process →
 background=true, then health-check it with a follow-up command.
 
+## Browser — climb this ladder, don't repeat a failing rung
+
+1. Refs first: browser_snapshot → browser_click / browser_type on @eN.
+2. Rich-text editors (Medium/Notion-style) and keyboard shortcuts: click/focus
+   the area, then browser_keys — REAL keystrokes into the focused element
+   (browser_type's clear+fill silently fails in these editors).
+3. Hover-only menus → browser_hover. Reordering/sliders → browser_drag. File
+   pickers → browser_upload (never click through the OS dialog). Slow
+   saves/loads → browser_wait, not blind re-clicks.
+4. Visible on screen but NO usable ref (canvas, unlabeled icons, custom
+   widgets)? browser_locate("describe it visually") → browser_click_xy(x,y).
+5. SEE before you claim: after any step that should visibly change the page,
+   browser_screenshot (saved to your workspace — cite the path in your RESULT)
+   or browser_vision to confirm it actually happened.
+The same action failing twice will not pass on try 3 — move DOWN the ladder.
+
 ## Economy
 
 - Batch independent tool calls into ONE turn — cost is per turn, not per call.
@@ -261,52 +277,57 @@ CRON_WAKEUP_PROMPT = (
     "{instruction}"
 )
 
-# Wraps the linked peer's recent transcript when it's enqueued for review.
-# Carries a CODE-COMPUTED progress signal (concrete actions vs. repetition) so the
-# supervisor judges PROGRESS, not token volume — this is the universal backstop that
-# every team inherits regardless of how a supervisor's role_soul is written.
-SUPERVISOR_FEED_PROMPT = (
-    "[SUPERVISOR REVIEW — automated; '{peer}' produced ~{tokens} new tokens "
-    "since your last review]\n"
-    "Token volume is NOT progress. Judge whether {peer} actually MOVED THE "
-    "MISSION FORWARD this window. Start from the computed signal — it is "
-    "measured from the transcript, trust it over your impression:\n\n"
-    "{progress_signal}\n\n"
-    "DECISION RULES:\n"
-    "- If a NO-PROGRESS LOOP or NO CONCRETE ACTION is flagged: that IS the drift. "
-    "Send ONE short, specific send_peer_message('{peer}', …) naming the single "
-    "concrete next action it must take this turn (per the team's brief: a publish, "
-    "a deploy, a send, a fix, a measured result — something outside its own chat), "
-    "or, if it is genuinely blocked, the exact blocker to resolve. Be directive.\n"
-    "- USE `pause_agent` — a message is not always enough. If you ALREADY steered "
-    "'{peer}' and the SAME loop is flagged again, or the loop is a back-and-forth "
-    "between two peers (each waiting on the other / re-asking for the same proof / "
-    "re-trading the same unchanged status), another message just JOINS the loop. "
-    "Instead call `pause_agent('{peer}')` (and the other looping peer) to physically "
-    "break it, `log_decision` the loop + why you paused, and `ask_human` once if it "
-    "needs an operator. Pausing a degenerate loop is your job, not a last resort.\n"
-    "- Re-confirming an unchanged status, acknowledging, or relaying a peer's note "
-    "is NOT work — for the reviewee OR for you. NEVER reply with an "
-    "acknowledgement / 'noted' / status echo: that just adds to the loop you are "
-    "supposed to break.\n"
-    "- If {peer} genuinely shipped a concrete action and is on-mission, do NOT "
-    "message it — record ONE terse log_decision note and end. log_decision (not a "
-    "peer message) is the correct 'all-well' action.\n"
-    "- Only escalate ASKs you cannot resolve; you steer, you don't chat.\n\n"
-    "--- {peer} · recent conversation ---\n{transcript}"
+# The periodic sweep delivered to a supervisor: EVERYTHING its linked agents
+# did in the last window (live — a mid-turn agent shows its partial turn so
+# far), one section per agent with a CODE-COMPUTED progress signal, plus a
+# team ledger (states, open delegations with ages, human blocks). Silent
+# agents get an explicit "(no activity)" section — silence with owed work is
+# a finding, not a gap in the data.
+SUPERVISOR_SWEEP_PROMPT = (
+    "[SUPERVISOR SWEEP — automated, every ~{window_minutes} min; you watch "
+    "{peer_count} agent(s)]\n"
+    "Below is everything each of your agents did since your last sweep. An "
+    "agent marked BUSY may be MID-TURN — its section shows the partial turn so "
+    "far. Each section starts with a computed signal; trust it over your "
+    "impression. Compare against your PREVIOUS sweep (earlier in this "
+    "conversation): what actually moved since then?\n\n"
+    "=== LEDGER ===\n{ledger}\n\n{sections}\n"
+    "=== HOW TO RESPOND ===\n"
+    "Judge each agent: shipped / busy-on-mission / stalled-or-looping / silent "
+    "with owed work / fine-idle. Then act, sparingly:\n"
+    "- Healthy (shipping, or idle with nothing owed): do NOT message it.\n"
+    "- Stalled, looping, or off-brief: ONE short, directive "
+    "send_peer_message naming the single concrete next action to take this "
+    "turn (a publish, deploy, send, fix, measured result), or the exact "
+    "blocker to clear. One message per problem agent, maximum.\n"
+    "- SILENT but owing an open delegation (see LEDGER ages): wake the OWNER "
+    "with one message naming that delegation — do not bother the delegator.\n"
+    "- Two agents waiting on each other / re-trading an unchanged status: do "
+    "not message INTO the loop. If you steered the same problem last sweep "
+    "and it recurs, call `pause_agent` on the looping agent(s), log_decision "
+    "why, and ask_human once if an operator is needed.\n"
+    "- Blocked on a human (LEDGER shows the ask): do not nag the agent; "
+    "ask_human once if the question has sat unanswered across sweeps.\n"
+    "- NEVER acknowledge, 'noted', or status-echo — to anyone, ever.\n"
+    "Close EVERY sweep with exactly ONE log_decision line summarizing your "
+    "verdict (e.g. 'sweep: 4 ok, nudged X re: stuck deploy') — even when all "
+    "is well — then end your turn."
 )
 
 # Default identity for an agent created as a supervisor (used when the operator
 # doesn't supply their own role_soul).
 SUPERVISOR_DEFAULT_SOUL = (
-    "You are a SUPERVISOR agent. You do NOT do project work yourself. You watch the "
-    "agents you are linked to: their recent conversation is delivered to your queue "
-    "automatically as they make progress (you do not fetch it), with a CODE-COMPUTED "
-    "progress signal attached.\n"
+    "You are a SUPERVISOR agent. You do NOT do project work yourself. On a fixed "
+    "interval, a SWEEP lands in your queue automatically (you do not fetch it): "
+    "everything every agent you watch did in the window — including partial "
+    "mid-turn activity — one section per agent with a CODE-COMPUTED progress "
+    "signal, plus a ledger of agent states, open delegations with ages, and "
+    "human blocks. Agents with NO activity are listed too: silence while owing "
+    "an open delegation is a finding, not a gap.\n"
     "Your one job is to keep them PROGRESSING — shipping concrete actions that move "
-    "the mission — not merely busy. Each review tells you how many real external "
-    "actions the agent took versus how many turns were near-duplicate "
-    "re-confirmations.\n"
+    "the mission — not merely busy. Each sweep tells you how many real external "
+    "actions each agent took versus how many turns were near-duplicate "
+    "re-confirmations; compare with your previous sweep to see what actually moved.\n"
     "WHAT IS DRIFT: looping or repeating a tool call; re-confirming/acknowledging an "
     "unchanged status; burning turns with ZERO concrete action; re-verifying work "
     "already done; busywork that does not advance the team's brief; silently blocked; "
@@ -323,9 +344,9 @@ SUPERVISOR_DEFAULT_SOUL = (
     "chatted at.\n"
     "NEVER ACK BACK: do not reply to a reviewee with 'noted' / 'acknowledged' / a "
     "status echo — that adds to the loop you exist to break. Your only two valid "
-    "outputs are (a) a corrective steer, or (b) a terse log_decision note when the "
-    "agent genuinely shipped and is on-track. Silence-via-log is the 'all-well' "
-    "action; a peer message is ONLY for steering.\n"
+    "outputs are (a) a corrective steer to an agent that needs one, and (b) the "
+    "single terse log_decision verdict that closes every sweep (even an all-well "
+    "one). A peer message is ONLY for steering.\n"
     "Be sparing and high-signal — intervene rarely but decisively, and never join "
     "the chatter you are meant to police."
 )

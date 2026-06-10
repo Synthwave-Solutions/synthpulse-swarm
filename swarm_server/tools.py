@@ -90,6 +90,7 @@ SELF_CONFIG_ALLOWED_KEYS = (
     "model", "provider", "temperature", "max_tokens", "reasoning_effort",
     "sweep_interval", "max_iterations", "enabled_toolsets", "disabled_toolsets",
     "compression_threshold", "autonomous", "heartbeat_seconds",
+    "supervisor_interval_minutes",
 )
 
 _pending_config_proposals: Dict[str, Dict[str, Any]] = {}
@@ -1251,6 +1252,17 @@ def _register_custom_tools():
                 description="Lift a pause on an agent once it's safe to continue.",
             )
             log.info("[resume_agent] Registered")
+
+        # GUI-grade browser tools (real keystrokes, hover, drag, coordinate
+        # click, screenshot, vision-grounded locate) — the agent-browser CLI
+        # commands Hermes doesn't expose. Schemas are appended per-agent in
+        # agent.py (never for supervisors, only when browser is active).
+        try:
+            from swarm_server.browser_gui_tools import register_gui_browser_tools
+
+            register_gui_browser_tools(registry)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[Custom Tools] GUI browser tools skipped: %s", exc)
 
         # Override built-in web_search / web_extract with crawl4ai-backed
         # handlers (ddgs / httpx fallback) so every agent uses crawl4ai as the
