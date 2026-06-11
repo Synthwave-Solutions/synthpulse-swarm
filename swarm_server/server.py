@@ -544,6 +544,98 @@ async def delete_team_credential(team_id: str, site: str):
 
 
 # ---------------------------------------------------------------------------
+# Team costs — REAL provider token counts (token_usage events), priced with
+# the swarm-side map. LiteLLM's Postgres SpendLogs stay the billing ground
+# truth; this is the operational view: who spends, cache hit rates, sweep
+# skip ratio.
+# ---------------------------------------------------------------------------
+@app.get("/teams/{team_id}/costs")
+async def get_team_costs(team_id: str, hours: float = 24):
+    import time
+
+    from swarm_server.model_config import estimate_cost_usd
+
+    hours = max(0.1, min(float(hours), 24 * 14))
+    since_ts = time.time() - hours * 3600
+    team_agents = get_team_agents(load_agents_config(), team_id) or {}
+    events = monitor_db.get_token_usage_events(
+        since_ts, agent_names=list(team_agents), team_id=team_id)
+    cfg_models = {name: (a.get("model") or "")
+                  for name, a in team_agents.items()}
+    per_agent: Dict[str, Dict[str, Any]] = {}
+    prev_cum: Dict[str, Dict[str, int]] = {}  # legacy-row differencing state
+
+    for ev in events:
+        agent = ev.get("agent_name") or "?"
+        try:
+            data = json.loads(ev.get("data") or "{}")
+        except Exception:
+            continue
+        model = (data.get("model") or cfg_models.get(agent) or "").strip()
+        if "turn_input_tokens" in data:
+            t_in = int(data.get("turn_input_tokens") or 0)
+            t_out = int(data.get("turn_output_tokens") or 0)
+            t_cache = int(data.get("turn_cache_read_tokens") or 0)
+        else:
+            # Legacy row: cumulative counters only. Difference against the
+            # previous legacy row for this agent; the first row in the window
+            # is the baseline (its turn happened mostly before the window).
+            cum = {"in": int(data.get("input_tokens") or 0),
+                   "out": int(data.get("output_tokens") or 0),
+                   "cache": int(data.get("cache_read_tokens") or 0),
+                   "total": int(data.get("total_tokens") or 0)}
+            prev = prev_cum.get(agent)
+            prev_cum[agent] = cum
+            if prev is None:
+                continue
+            if cum["total"] < prev["total"]:  # session rotated → counter reset
+                prev = {"in": 0, "out": 0, "cache": 0, "total": 0}
+            t_in = max(0, cum["in"] - prev["in"])
+            t_out = max(0, cum["out"] - prev["out"])
+            t_cache = max(0, cum["cache"] - prev["cache"])
+
+        a = per_agent.setdefault(agent, {
+            "turns": 0, "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "est_cost_usd": 0.0, "model": model,
+            "unpriced": False})
+        a["turns"] += 1
+        a["input_tokens"] += t_in
+        a["output_tokens"] += t_out
+        a["cache_read_tokens"] += t_cache
+        if model:
+            a["model"] = model
+        cost = estimate_cost_usd(model, t_in, t_out, t_cache)
+        if cost is None:
+            a["unpriced"] = True
+        else:
+            a["est_cost_usd"] += cost
+
+    totals = {"turns": 0, "input_tokens": 0, "output_tokens": 0,
+              "cache_read_tokens": 0, "est_cost_usd": 0.0}
+    for name, a in per_agent.items():
+        seen = a["input_tokens"] + a["cache_read_tokens"]
+        a["cache_hit_pct"] = round(100.0 * a["cache_read_tokens"] / seen, 1) if seen else 0.0
+        a["est_cost_usd"] = round(a["est_cost_usd"], 4)
+        for k in totals:
+            totals[k] += a[k]
+    totals["est_cost_usd"] = round(totals["est_cost_usd"], 4)
+    seen = totals["input_tokens"] + totals["cache_read_tokens"]
+    totals["cache_hit_pct"] = round(100.0 * totals["cache_read_tokens"] / seen, 1) if seen else 0.0
+
+    sweeps = {"queued": 0, "skipped": 0}
+    for name, a in team_agents.items():
+        if a.get("is_supervisor"):
+            sweeps["queued"] += monitor_db.count_events_since(
+                name, "supervisor_sweep", since_ts)
+            sweeps["skipped"] += monitor_db.count_events_since(
+                name, "supervisor_sweep_skipped", since_ts)
+
+    return JSONResponse({"team_id": team_id, "hours": hours,
+                         "agents": per_agent, "totals": totals,
+                         "sweeps": sweeps})
+
+
+# ---------------------------------------------------------------------------
 # Agent Management Routes
 # ---------------------------------------------------------------------------
 @app.get("/agents")

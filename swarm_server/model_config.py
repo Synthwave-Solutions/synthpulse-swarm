@@ -303,3 +303,37 @@ def resolve_model(agent_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "base_url": base_url, "api_key": api_key,
         "source": "agent" if overridden else base_source,
     }
+
+
+# ---------------------------------------------------------------------------
+# Swarm-side pricing — USD per 1M tokens: (input, output, cached_input).
+# Hermes can't price models behind the LiteLLM proxy (its estimated_cost_usd
+# is always 0 there), so the /teams/{id}/costs endpoint prices the token
+# deltas with this map. cached_input None = provider reports no cached tier
+# (Azure-hosted DeepSeek/Kimi don't prompt-cache — verified empirically).
+# Keep in sync with the proxy's model_info blocks; LiteLLM's Postgres
+# SpendLogs remain the billing ground truth.
+# ---------------------------------------------------------------------------
+MODEL_PRICES_PER_MILLION: Dict[str, tuple] = {
+    "litellm-model":      (0.19, 0.51, None),
+    "deepseek-v4-flash":  (0.19, 0.51, None),
+    "kimi":               (0.19, 0.51, None),
+    "gpt-5.4-mini":       (0.25, 2.00, 0.025),
+    "gpt-5.4-nano":       (0.05, 0.40, 0.005),
+}
+
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int,
+                      cache_read_tokens: int = 0) -> Optional[float]:
+    """Price a token bundle, or None for unknown models (the dashboard shows
+    'n/a' rather than a wrong number). input_tokens must EXCLUDE cached reads
+    (Hermes' canonical usage already subtracts them); cached reads are priced
+    at the cached tier, falling back to 10% of input price."""
+    prices = MODEL_PRICES_PER_MILLION.get((model or "").strip().lower())
+    if not prices:
+        return None
+    p_in, p_out, p_cache = prices
+    if p_cache is None:
+        p_cache = p_in * 0.1
+    return (input_tokens * p_in + output_tokens * p_out
+            + cache_read_tokens * p_cache) / 1_000_000.0

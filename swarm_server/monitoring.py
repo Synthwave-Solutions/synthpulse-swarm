@@ -670,6 +670,55 @@ class MonitoringDB:
             log.warning("[MonitorDB] get_events_since failed: %s", e)
             return []
 
+    def get_token_usage_events(self, since_ts: float,
+                               agent_names: Optional[List[str]] = None,
+                               team_id: Optional[str] = None,
+                               limit: int = 5000) -> List[dict]:
+        """token_usage events newer than since_ts, OLDEST first (id ASC) so
+        the costs endpoint can difference legacy cumulative rows per agent in
+        order. Scope with agent_names (the config is the membership authority —
+        events are written with team_id NULL); team_id is OR-ed in as a
+        belt-and-braces match, or used via _team_filter when no names given."""
+        try:
+            with self._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                sql = ("SELECT * FROM events WHERE event_type = 'token_usage' "
+                       "AND timestamp >= ?")
+                params: list = [since_ts]
+                if agent_names:
+                    ph = ",".join("?" * len(agent_names))
+                    if team_id:
+                        sql += f" AND (agent_name IN ({ph}) OR team_id = ?)"
+                        params += list(agent_names) + [team_id]
+                    else:
+                        sql += f" AND agent_name IN ({ph})"
+                        params += list(agent_names)
+                elif team_id:
+                    tclause, tparams = self._team_filter(conn, team_id)
+                    if tclause:
+                        sql += " AND " + tclause
+                        params += tparams
+                sql += " ORDER BY id ASC LIMIT ?"
+                params.append(limit)
+                return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+        except Exception as e:
+            log.warning("[MonitorDB] get_token_usage_events failed: %s", e)
+            return []
+
+    def count_events_since(self, agent_name: str, event_type: str,
+                           since_ts: float) -> int:
+        """Cheap COUNT of one agent's events of one type newer than since_ts."""
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE agent_name = ? "
+                    "AND event_type = ? AND timestamp >= ?",
+                    (agent_name, event_type, since_ts),
+                ).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
     def count_actions_since(self, team_id: str, since_ts: float) -> int:
         try:
             with self._conn() as conn:

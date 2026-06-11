@@ -276,6 +276,99 @@ def _browser_keys_handler(args: dict, **kwargs) -> str:
     return json.dumps(out, ensure_ascii=False, default=str)
 
 
+BROWSER_STEPS_MAX = 10
+
+# action name -> (CLI command, required arg keys, optional builder note)
+_STEP_ACTIONS = {
+    "navigate":       ("open", ("url",)),
+    "click":          ("click", ("ref",)),
+    "fill":           ("fill", ("ref", "text")),
+    "type":           ("keyboard", ("text",)),   # real keystrokes into focus
+    "press":          ("press", ("key",)),
+    "wait":           ("wait", ("for",)),
+    "hover":          ("hover", ("ref",)),
+    "scrollintoview": ("scrollintoview", ("ref",)),
+}
+
+
+def _step_cli_args(action: str, step: dict) -> List[str]:
+    """Translate one validated step into agent-browser CLI args."""
+    if action == "navigate":
+        return [str(step["url"]).strip()]
+    if action == "fill":
+        return [str(step["ref"]).strip(), str(step["text"])]
+    if action == "type":
+        return ["type", str(step["text"])]
+    if action == "press":
+        return [str(step["key"]).strip()]
+    if action == "wait":
+        target = str(step["for"]).strip()
+        try:  # numeric waits are capped, same as browser_wait
+            target = str(min(int(float(target)), 15000))
+        except ValueError:
+            pass
+        return [target]
+    return [str(step["ref"]).strip()]  # click / hover / scrollintoview
+
+
+def _browser_steps_handler(args: dict, **kwargs) -> str:
+    """Run a SHORT mechanical sequence in ONE tool call. Every extra round
+    trip to the model re-bills the agent's entire context, so a known
+    click→type→press flow should be one call, not N."""
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return json.dumps({"success": False, "error": "'steps' (non-empty array) is required."})
+    if len(steps) > BROWSER_STEPS_MAX:
+        return json.dumps({"success": False,
+                           "error": f"max {BROWSER_STEPS_MAX} steps per call — split the sequence."})
+    # Validate EVERYTHING up front: a malformed step 7 must not half-run the page.
+    for i, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            return json.dumps({"success": False, "error": f"step {i} is not an object."})
+        action = str(step.get("action") or "").strip().lower()
+        if action not in _STEP_ACTIONS:
+            return json.dumps({"success": False,
+                               "error": f"step {i}: unknown action '{action}'. "
+                                        f"Valid: {', '.join(sorted(_STEP_ACTIONS))}."})
+        missing = [k for k in _STEP_ACTIONS[action][1] if step.get(k) in (None, "")]
+        if missing:
+            return json.dumps({"success": False,
+                               "error": f"step {i} ({action}): missing {missing}."})
+        if action == "type" and "\n" in str(step.get("text")):
+            return json.dumps({"success": False,
+                               "error": f"step {i}: multi-line text belongs in browser_keys, "
+                                        f"which presses a real Enter per line."})
+
+    task_id = _task_id_from_kwargs(kwargs)
+    done: List[str] = []
+    failed: Optional[Dict[str, Any]] = None
+    failed_idx = 0
+    for i, step in enumerate(steps, 1):
+        action = str(step["action"]).strip().lower()
+        command = _STEP_ACTIONS[action][0]
+        result = _ab(task_id, command, _step_cli_args(action, step))
+        if not result.get("success"):
+            failed, failed_idx = result, i
+            break
+        done.append(action)
+
+    out: Dict[str, Any] = {
+        "success": failed is None,
+        "command": f"steps <{len(steps)}: {', '.join(s.get('action', '?') for s in steps)}>",
+        "steps_done": len(done),
+    }
+    if failed is not None:
+        out["error"] = failed.get("error", "unknown agent-browser error")
+        out["failed_step"] = {"index": failed_idx,
+                              "action": steps[failed_idx - 1].get("action")}
+        out["resume_hint"] = (
+            f"Steps 1-{len(done)} of {len(steps)} already ran and changed the page — "
+            f"do NOT re-run them. Check the page state (and page_alerts below), fix "
+            f"step {failed_idx}, then continue from step {failed_idx} only.")
+    out.update(_breadcrumb(task_id))  # ONE breadcrumb for the whole sequence
+    return json.dumps(out, ensure_ascii=False, default=str)
+
+
 def _browser_hover_handler(args: dict, **kwargs) -> str:
     ref = (args.get("ref") or "").strip()
     if not ref:
@@ -714,7 +807,46 @@ BROWSER_LOCATE_TOOL_SCHEMA = _schema(
     ["description"],
 )
 
+BROWSER_STEPS_TOOL_SCHEMA = _schema(
+    "browser_steps",
+    "Run a SHORT mechanical browser sequence in ONE call — click → type → "
+    "press, fill a small form, dismiss-banner-then-click. Each step runs in "
+    "order and the call STOPS at the first failure, reporting steps_done, the "
+    "failed step, page_alerts, and how to resume. Use this whenever you "
+    "already know the next 2-10 actions; one call instead of N separate calls "
+    "(every extra call re-sends your whole context). Multi-line typing still "
+    "belongs in browser_keys; exploration (snapshot, locate) stays separate.",
+    {"steps": {
+        "type": "array",
+        "maxItems": BROWSER_STEPS_MAX,
+        "description": "2-10 steps, run in order, stop on first failure.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": sorted(_STEP_ACTIONS),
+                           "description": "What to do in this step."},
+                "ref": {**_REF_PROP,
+                        "description": "Element for click/fill/hover/scrollintoview "
+                                       "(snapshot ref like '@e5' or CSS selector)."},
+                "text": {"type": "string",
+                         "description": "Text for fill (clear-and-set an input) or "
+                                        "type (real keystrokes into current focus; "
+                                        "single-line only)."},
+                "url": {"type": "string", "description": "URL for navigate."},
+                "key": {"type": "string",
+                        "description": "Key for press (e.g. 'Enter', 'Tab', 'Escape')."},
+                "for": {"type": "string",
+                        "description": "For wait: CSS selector/@ref to wait for, OR "
+                                       "milliseconds (max 15000)."},
+            },
+            "required": ["action"],
+        }}},
+    ["steps"],
+)
+
 GUI_BROWSER_TOOL_SCHEMAS = (
+    BROWSER_STEPS_TOOL_SCHEMA,
     BROWSER_KEYS_TOOL_SCHEMA,
     BROWSER_HOVER_TOOL_SCHEMA,
     BROWSER_DBLCLICK_TOOL_SCHEMA,
@@ -728,6 +860,7 @@ GUI_BROWSER_TOOL_SCHEMAS = (
 )
 
 _HANDLERS = {
+    "browser_steps": _browser_steps_handler,
     "browser_keys": _browser_keys_handler,
     "browser_hover": _browser_hover_handler,
     "browser_dblclick": _browser_dblclick_handler,

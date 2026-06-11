@@ -41,6 +41,7 @@ from swarm_server.browser_gui_tools import (  # noqa: E402
     _browser_locate_handler,
     _browser_screenshot_handler,
     _browser_scrollintoview_handler,
+    _browser_steps_handler,
     _browser_upload_handler,
     _browser_wait_handler,
     _parse_locate_reply,
@@ -99,7 +100,7 @@ def test_schemas_well_formed():
         for req in params.get("required", []):
             assert req in params["properties"], f"{fn['name']}: required '{req}' undeclared"
         assert fn["description"].strip()
-    assert len(names) == len(set(names)) == 10
+    assert len(names) == len(set(names)) == 11
     # They must not shadow the built-in Hermes browser tools.
     for built_in in ("browser_navigate", "browser_click", "browser_type",
                      "browser_snapshot", "browser_vision", "browser_press"):
@@ -583,6 +584,88 @@ def test_locate_endpoint_prefers_capable_main_model(monkeypatch, clean_probe_cac
                         lambda m, b, k: (_ for _ in ()).throw(RuntimeError("no images")))
     ep = gui._resolve_vision_endpoint("tester")
     assert ep["model"] == config.get_vision_model()
+
+
+# ---------------------------------------------------------------------------
+# 11. browser_steps — composite sequences in one call
+# ---------------------------------------------------------------------------
+
+def test_steps_runs_sequence_in_order(ab_recorder):
+    out = json.loads(_browser_steps_handler({"steps": [
+        {"action": "navigate", "url": "https://x.test/login"},
+        {"action": "click", "ref": "@e1"},
+        {"action": "type", "text": "hello"},
+        {"action": "press", "key": "Enter"},
+        {"action": "wait", "for": "30000"},
+        {"action": "fill", "ref": "#q", "text": "v"},
+    ]}, **KW))
+    assert out["success"] is True
+    assert out["steps_done"] == 6
+    assert ab_recorder == [
+        ("open", ["https://x.test/login"]),
+        ("click", ["@e1"]),
+        ("keyboard", ["type", "hello"]),
+        ("press", ["Enter"]),
+        ("wait", ["15000"]),          # numeric waits capped like browser_wait
+        ("fill", ["#q", "v"]),
+    ]
+    assert out["url"] == "https://x.test/p"  # ONE trailing breadcrumb
+
+
+def test_steps_stops_at_first_failure_with_resume_hint(monkeypatch):
+    calls = []
+
+    def fake_ab(task_id, command, args=None, timeout=None):
+        calls.append(command)
+        if len(calls) == 3:
+            return {"success": False, "error": "element not found"}
+        return {"success": True}
+
+    monkeypatch.setattr(gui, "_ab", fake_ab)
+    monkeypatch.setattr(gui, "_breadcrumb",
+                        lambda task_id: {"page_alerts": ["Wrong password"]})
+    out = json.loads(_browser_steps_handler({"steps": [
+        {"action": "click", "ref": "@e1"},
+        {"action": "type", "text": "user"},
+        {"action": "press", "key": "Enter"},
+        {"action": "click", "ref": "@e9"},
+    ]}, **KW))
+    assert out["success"] is False
+    assert out["steps_done"] == 2
+    assert out["failed_step"] == {"index": 3, "action": "press"}
+    assert "continue from step 3" in out["resume_hint"]
+    assert out["page_alerts"] == ["Wrong password"]
+    assert calls == ["click", "keyboard", "press"]  # step 4 never ran
+
+
+def test_steps_validates_before_running_anything(ab_recorder):
+    # Unknown action in step 2 -> NOTHING runs (no half-mutated page).
+    out = json.loads(_browser_steps_handler({"steps": [
+        {"action": "click", "ref": "@e1"},
+        {"action": "frobnicate"},
+    ]}, **KW))
+    assert out["success"] is False and "frobnicate" in out["error"]
+    assert ab_recorder == []
+
+    # Missing required key.
+    out = json.loads(_browser_steps_handler({"steps": [{"action": "click"}]}, **KW))
+    assert out["success"] is False and "ref" in out["error"]
+    assert ab_recorder == []
+
+    # Multi-line type is browser_keys' job.
+    out = json.loads(_browser_steps_handler(
+        {"steps": [{"action": "type", "text": "a\nb"}]}, **KW))
+    assert out["success"] is False and "browser_keys" in out["error"]
+    assert ab_recorder == []
+
+
+def test_steps_caps_count_and_requires_array(ab_recorder):
+    out = json.loads(_browser_steps_handler({"steps": [
+        {"action": "press", "key": "Tab"}] * 11}, **KW))
+    assert out["success"] is False and "max 10" in out["error"]
+    out = json.loads(_browser_steps_handler({}, **KW))
+    assert out["success"] is False
+    assert ab_recorder == []
 
 
 if __name__ == "__main__":

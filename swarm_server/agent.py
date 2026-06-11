@@ -29,9 +29,15 @@ from swarm_server.config import (
     SELF_LOOP_WINDOW,
     SUPERVISOR_FEED_CHAR_CAP,
     SUPERVISOR_SWEEP_CHAR_CAP,
+    SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS,
     SUPERVISOR_SWEEP_INTERVAL_MINUTES,
+    SUPERVISOR_SWEEP_MAX_IDLE_SKIPS,
     SUPERVISOR_SWEEP_PER_PEER_FLOOR,
     SWEEP_INTERVAL_SECONDS,
+    TOOL_RESULT_AGE_ENABLED,
+    TOOL_RESULT_AGE_KEEP_MESSAGES,
+    TOOL_RESULT_AGE_MIN_CHARS,
+    TOOL_RESULT_AGE_QUANTUM,
     _derive_workspace_path,
     _ensure_project_dir,
     load_agents_config,
@@ -44,6 +50,7 @@ from swarm_server.prompts import (
     SELF_LOOP_NUDGE,
     SUPERVISOR_SWEEP_PROMPT,
     TEXT_ONLY_TURN_NUDGE,
+    age_stale_tool_results,
     compose_agent_soul,
     compose_live_context,
     compose_soul_identity,
@@ -340,8 +347,16 @@ class AgentDaemon:
         self._pause_reason = ""
         self._paused_by = ""
         # Hermes reports session-CUMULATIVE token counts; we track the last
-        # total so each batch can log its real delta (not just a char estimate).
+        # totals so each batch can log its real per-turn deltas (not just a
+        # char estimate). All four counters share one reset rule: a shrinking
+        # cumulative total means the session rotated/compacted.
         self._last_total_tokens = 0
+        self._last_input_tokens = 0
+        self._last_output_tokens = 0
+        self._last_cache_read_tokens = 0
+        # Resolved model name (set in _ensure_agent) — logged with every
+        # token_usage event so cost attribution survives mid-life model swaps.
+        self._current_model = ""
         # 24/7 autonomy: when True, this daemon self-injects a continue-mission
         # task after AUTONOMOUS_HEARTBEAT_SECONDS of idle (empty queue). Set per
         # agent via cfg["autonomous"] — typically only the team coordinator.
@@ -393,6 +408,16 @@ class AgentDaemon:
         # token-threshold reviews. Seeded to "now" so the first sweep covers
         # daemon-start → first tick, never history.
         self._last_sweep_ts = time.time()
+        # Idle-skip state. _last_sweep_check_ts is the cadence clock (a skip
+        # must wait a full interval before re-checking — without it a skip
+        # re-evaluates every daemon tick and fires seconds after the first new
+        # message); _last_sweep_ts stays the WINDOW anchor so a post-skip sweep
+        # honestly reports the longer window. _sup_idle_skips counts consecutive
+        # skips toward the forced idle backstop; _last_delegation_force_ts
+        # rate-limits the stale-delegation early fire.
+        self._last_sweep_check_ts = 0.0
+        self._sup_idle_skips = 0
+        self._last_delegation_force_ts = 0.0
         # Idle-heartbeat backoff: consecutive heartbeat turns that produced no
         # concrete action. Effective interval = base * 2**min(misses, cap), so a
         # genuinely-idle 24/7 agent costs exponentially less instead of burning
@@ -574,6 +599,7 @@ class AgentDaemon:
 
                 eff = resolve_model(self.cfg)
                 model = eff["model"]
+                self._current_model = model
                 _eff_base = eff["base_url"] or None
                 _eff_key = eff["api_key"] or None
                 _eff_provider = eff["provider"] or None
@@ -877,6 +903,16 @@ class AgentDaemon:
                         m = {**m, "content": stripped}
                 cleaned.append(m)
             msgs = cleaned
+            # Second hygiene pass: age out OLD, LARGE tool results. They are
+            # 50-60% of a working agent's history but almost never read again —
+            # and unlike compaction, a stub is recoverable (re-run the tool).
+            if TOOL_RESULT_AGE_ENABLED:
+                msgs = age_stale_tool_results(
+                    msgs,
+                    keep_recent=TOOL_RESULT_AGE_KEEP_MESSAGES,
+                    min_chars=TOOL_RESULT_AGE_MIN_CHARS,
+                    quantum=TOOL_RESULT_AGE_QUANTUM,
+                )
             log.debug("[%s] Loaded %d messages from session %s", self.name, len(msgs), current_sid)
             return msgs
         except Exception as e:
@@ -1479,6 +1515,19 @@ class AgentDaemon:
             pass
         return "\n".join(lines)
 
+    def _oldest_open_delegation_age(self, peers: List[str],
+                                    now: float) -> Optional[float]:
+        """Age (seconds) of the oldest open delegation involving a watched
+        peer, or None. Same scoping as _sweep_ledger."""
+        try:
+            dels = monitor_db.get_open_delegations(
+                team_id=self.cfg.get("team_id"), limit=30)
+        except Exception:
+            return None
+        ages = [max(0.0, now - float(d.get("timestamp") or now)) for d in dels
+                if d.get("to_agent") in peers or d.get("from_agent") in peers]
+        return max(ages) if ages else None
+
     def _maybe_feed_supervisor(self) -> None:
         """Supervisor agents only: every sweep interval, push ONE task into
         THIS agent's own queue carrying everything every linked peer did since
@@ -1494,6 +1543,16 @@ class AgentDaemon:
         over SUPERVISOR_SWEEP_INTERVAL_MINUTES. If the supervisor is busy when
         the interval elapses, the sweep fires on the next idle tick and the
         window simply covers the longer span — watermarks keep it gapless.
+
+        IDLE-SKIP: when no watched peer logged a single message this window,
+        the sweep is skipped (a cheap per-peer COUNT instead of a measured
+        ~85k-token all-IDLE LLM turn) — but never silence-blind: every
+        SUPERVISOR_SWEEP_MAX_IDLE_SKIPS-th consecutive idle interval forces a
+        full review (the idle-but-OWING guarantee this sweep design exists
+        for), and an open delegation older than
+        SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS forces one early, rate-limited
+        to once per age window. Skips never advance watermarks, so the next
+        real sweep covers the whole quiet span.
         """
         if not self.cfg.get("is_supervisor") or self._stop_requested:
             return
@@ -1505,27 +1564,69 @@ class AgentDaemon:
         except Exception:
             return
         now = time.time()
-        if now - self._last_sweep_ts < self._supervisor_interval_seconds():
+        # A skip waits a full interval before re-checking; _last_sweep_ts alone
+        # would re-evaluate every daemon tick and fire seconds after the first
+        # new message.
+        if (now - max(self._last_sweep_ts, self._last_sweep_check_ts)
+                < self._supervisor_interval_seconds()):
             return
         peers = [p for p in (self.cfg.get("allowed_peers") or []) if p != self.name]
         if not peers:
             self._last_sweep_ts = now
             return
         try:
-            peer_data: List[Dict[str, Any]] = []
-            new_marks: Dict[str, int] = {}
+            # Cheap idle probe: one aggregate row per peer, no content pulled.
+            # First-seen peers are anchored here (same as the build path did)
+            # and count as "no activity" — the next window covers them fully.
+            new_total = 0
             for peer in peers:
                 wm = self._sup_watermark.get(peer)
                 if wm is None:
                     # First sight of this peer (fresh daemon or newly linked):
-                    # anchor to its current latest id — this sweep reports it
-                    # honestly as "no activity", the next covers it fully.
-                    # Never dump a peer's entire history.
+                    # anchor to its current latest id. Never dump history.
                     try:
                         wm = monitor_db.get_new_activity(peer, 0)["max_id"]
                     except Exception:
                         wm = 0
                     self._sup_watermark[peer] = wm
+                    continue
+                try:
+                    new_total += int(monitor_db.get_new_activity(peer, wm)["count"])
+                except Exception:
+                    new_total += 1  # fail OPEN: a probe error must not mute oversight
+
+            force_reason = ""
+            if new_total == 0:
+                if self._sup_idle_skips + 1 >= SUPERVISOR_SWEEP_MAX_IDLE_SKIPS:
+                    force_reason = "idle_backstop"  # idle-but-owing review
+                else:
+                    age = self._oldest_open_delegation_age(peers, now)
+                    if (age is not None
+                            and age >= SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS
+                            and now - self._last_delegation_force_ts
+                            >= SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS):
+                        force_reason = "stale_delegation"
+                        self._last_delegation_force_ts = now
+
+            if new_total == 0 and not force_reason:
+                self._sup_idle_skips += 1
+                self._last_sweep_check_ts = now
+                monitor_db.log_event(
+                    self.name, "supervisor_sweep_skipped",
+                    data={"peers": len(peers),
+                          "consecutive_skips": self._sup_idle_skips,
+                          "forced_after": SUPERVISOR_SWEEP_MAX_IDLE_SKIPS,
+                          "window_seconds": int(now - self._last_sweep_ts)},
+                )
+                log.info("[%s] sweep skipped — no peer activity (%d/%d before "
+                         "forced review)", self.name, self._sup_idle_skips,
+                         SUPERVISOR_SWEEP_MAX_IDLE_SKIPS)
+                return
+
+            peer_data: List[Dict[str, Any]] = []
+            new_marks: Dict[str, int] = {}
+            for peer in peers:
+                wm = self._sup_watermark[peer]
                 msgs = monitor_db.get_messages_since(peer, wm)
                 new_marks[peer] = max([int(m["id"]) for m in msgs], default=wm)
                 state, pending = self._peer_runtime_state(peer)
@@ -1552,13 +1653,16 @@ class AgentDaemon:
                 data={"peers": len(peers),
                       "active": sum(1 for d in peer_data if d["messages"]),
                       "chars": len(prompt),
+                      "forced": force_reason or None,
                       "window_seconds": int(now - self._last_sweep_ts)},
             )
             self.ingest_task("supervisor-sweep", prompt)
-            # Commit watermarks + clock only after the sweep is safely queued,
+            # Commit watermarks + clocks only after the sweep is safely queued,
             # so a failure above retries the same window on the next tick.
             self._sup_watermark.update(new_marks)
             self._last_sweep_ts = now
+            self._last_sweep_check_ts = now
+            self._sup_idle_skips = 0
         except Exception as e:
             log.warning("[%s] supervisor sweep failed: %s", self.name, e)
 
@@ -1946,22 +2050,42 @@ class AgentDaemon:
                 return
 
             # Record REAL token usage. Hermes returns session-cumulative counts,
-            # so we log this batch's delta plus the running total + cost — actual
-            # numbers from the provider, not the char-based message estimate.
+            # so we log this batch's per-turn deltas plus the running totals —
+            # actual numbers from the provider, not the char-based message
+            # estimate. (Hermes' estimated_cost_usd is always 0 for proxy
+            # models, so pricing lives swarm-side: see MODEL_PRICES_PER_MILLION
+            # and the /teams/{id}/costs endpoint.)
             try:
                 total = int(response.get("total_tokens", 0) or 0)
+                inp = int(response.get("input_tokens", 0) or 0)
+                outp = int(response.get("output_tokens", 0) or 0)
+                cache = int(response.get("cache_read_tokens", 0) or 0)
+                if total < self._last_total_tokens:
+                    # Session rotated/compacted → all cumulative counters reset.
+                    self._last_total_tokens = 0
+                    self._last_input_tokens = 0
+                    self._last_output_tokens = 0
+                    self._last_cache_read_tokens = 0
                 delta = total - self._last_total_tokens
-                if delta < 0:  # session rotated/compacted -> counter reset
-                    delta = total
+                turn_in = max(0, inp - self._last_input_tokens)
+                turn_out = max(0, outp - self._last_output_tokens)
+                turn_cache = max(0, cache - self._last_cache_read_tokens)
                 self._last_total_tokens = total
+                self._last_input_tokens = inp
+                self._last_output_tokens = outp
+                self._last_cache_read_tokens = cache
                 monitor_db.log_event(
                     self.name, "token_usage",
                     data={
+                        "model": self._current_model,
                         "delta_tokens": delta,
                         "total_tokens": total,
-                        "input_tokens": int(response.get("input_tokens", 0) or 0),
-                        "output_tokens": int(response.get("output_tokens", 0) or 0),
-                        "cache_read_tokens": int(response.get("cache_read_tokens", 0) or 0),
+                        "input_tokens": inp,
+                        "output_tokens": outp,
+                        "cache_read_tokens": cache,
+                        "turn_input_tokens": turn_in,
+                        "turn_output_tokens": turn_out,
+                        "turn_cache_read_tokens": turn_cache,
                         "estimated_cost_usd": response.get("estimated_cost_usd", 0),
                     },
                 )

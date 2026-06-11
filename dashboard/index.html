@@ -414,6 +414,7 @@ button.msg-header, button.cc-divider, button.exec-label { width: 100%; }
         <span>Busy <span class="stat-badge" id="stat-busy">0</span></span>
         <span>Queued <span class="stat-badge" id="stat-queued">0</span></span>
         <span>Events <span class="stat-badge" id="stat-events">0</span></span>
+        <span id="stat-cost-wrap" style="display:none;cursor:help" title="">Cost 24h <span class="stat-badge" id="stat-cost">—</span></span>
     </div>
     <div style="display:flex;align-items:center;gap:12px">
         <button id="inbox-btn" class="btn btn-sm btn-secondary" onclick="toggleInbox()" style="position:relative;">
@@ -2021,6 +2022,7 @@ async function loadTeams() {
             sel.value = currentTeam;
         }
         refreshData();
+        loadTeamCosts();
     } catch (e) { console.error(e); }
 }
 
@@ -2029,7 +2031,36 @@ function changeTeam(teamId) {
     selectedAgent = null;
     agentData = {};
     refreshData();
+    loadTeamCosts();
 }
+
+/* ===== TEAM COSTS (24h) =====
+   Real provider token counts from token_usage events, priced server-side
+   (GET /teams/{id}/costs). Topbar badge = team total; tooltip = per-agent
+   in/out/cache-hit/$ plus the supervisor sweep run/skip ratio. */
+async function loadTeamCosts() {
+    if (!currentTeam) return;
+    const team = currentTeam;
+    try {
+        const res = await fetch(`${API_URL}/teams/${encodeURIComponent(team)}/costs?hours=24`);
+        const d = await res.json();
+        if (currentTeam !== team || !d.totals) return;  // stale-response guard
+        const wrap = document.getElementById('stat-cost-wrap');
+        const el = document.getElementById('stat-cost');
+        if (!wrap || !el) return;
+        const t = d.totals;
+        const anyUnpriced = Object.values(d.agents || {}).some(a => a.unpriced);
+        el.textContent = `$${(t.est_cost_usd || 0).toFixed(2)}${anyUnpriced ? '+' : ''}`;
+        const fmtM = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.round(n / 1e3) + 'k';
+        const lines = Object.entries(d.agents || {})
+            .sort((a, b) => (b[1].est_cost_usd || 0) - (a[1].est_cost_usd || 0))
+            .map(([n, a]) => `${n}: $${(a.est_cost_usd || 0).toFixed(2)} · in ${fmtM(a.input_tokens)} · out ${fmtM(a.output_tokens)} · cache ${a.cache_hit_pct}%${a.unpriced ? ' (model unpriced)' : ''}`);
+        lines.push(`team: ${t.turns} turns · cache hit ${t.cache_hit_pct}% · sweeps ${d.sweeps.queued} run / ${d.sweeps.skipped} skipped`);
+        wrap.title = lines.join('\n');
+        wrap.style.display = '';
+    } catch (e) { /* non-fatal */ }
+}
+setInterval(loadTeamCosts, 60000);
 
 function showAddTeam() { showModal('modal-add-team'); }
 function showAddAgent() { showModal('modal-add-agent'); }

@@ -302,13 +302,36 @@ TOOL_OUTPUT_MAX_LINES = 400
 TOOL_OUTPUT_MAX_LINE_LENGTH = 2000
 
 # ---------------------------------------------------------------------------
+# Tool-result aging — stub out OLD, LARGE tool results at history replay.
+# Measured: tool results are 50-60% of a working agent's history, and every
+# LLM iteration (10-25 per turn) re-bills the full history — yet a stale
+# browser snapshot or file dump is almost never read again, and is recoverable
+# by re-running the tool. Replacing them with one-line stubs cuts a large slice
+# of every request without summarizing away anything the agent said or decided
+# (see prompts.age_stale_tool_results). KEEP_MESSAGES is the protected working
+# set at the history tail; QUANTUM makes the cutoff advance in steps so the
+# request prefix stays byte-stable between steps (a provider prompt cache
+# survives ~QUANTUM messages instead of busting every turn).
+# ---------------------------------------------------------------------------
+TOOL_RESULT_AGE_ENABLED = os.environ.get(
+    "SWARM_TOOL_RESULT_AGE_ENABLED", "1").lower() not in ("0", "false", "no")
+TOOL_RESULT_AGE_KEEP_MESSAGES = int(os.environ.get("SWARM_TOOL_RESULT_AGE_KEEP_MESSAGES", "40"))
+TOOL_RESULT_AGE_MIN_CHARS = int(os.environ.get("SWARM_TOOL_RESULT_AGE_MIN_CHARS", "600"))
+TOOL_RESULT_AGE_QUANTUM = int(os.environ.get("SWARM_TOOL_RESULT_AGE_QUANTUM", "20"))
+
+# ---------------------------------------------------------------------------
+# Live-context size caps. The live block is rebuilt fresh each turn AND rides
+# in history for every iteration of that turn, so each item here is paid
+# dozens of times per turn. Keep it a digest, not a dump — anything an agent
+# needs in full it can read from the shared store.
+# ---------------------------------------------------------------------------
+LIVE_CTX_TREE_MAX_ENTRIES = int(os.environ.get("SWARM_LIVE_CTX_TREE_MAX_ENTRIES", "60"))
+LIVE_CTX_PEER_MESSAGES = int(os.environ.get("SWARM_LIVE_CTX_PEER_MESSAGES", "6"))
+LIVE_CTX_DECISIONS = int(os.environ.get("SWARM_LIVE_CTX_DECISIONS", "12"))
+LIVE_CTX_COMPLETED = int(os.environ.get("SWARM_LIVE_CTX_COMPLETED", "5"))
+
+# ---------------------------------------------------------------------------
 # Disabled toolsets — removed from every agent's tool schema at init.
-# delegate_task (the "delegation" toolset) is intentionally LEFT ENABLED: agents
-# may spawn Hermes sub-agents for parallel subtasks. The old browser-collision
-# problem (concurrent sub-agents driving one shared tab) is fixed instead by
-# browser.fresh_tab_per_task (see write_agent_hermes_config) — each sub-agent's
-# unique task_id now gets its own tab in the shared Chrome. Keep this list as
-# the hook for disabling toolsets in the future.
 # ---------------------------------------------------------------------------
 # Hermes ships ~71 tools across many toolsets; every enabled tool's JSON schema
 # is re-sent on EVERY turn (measured ~11k tokens for the default selection) and
@@ -316,11 +339,19 @@ TOOL_OUTPUT_MAX_LINE_LENGTH = 2000
 # system prompt. This swarm only ever uses browser + terminal/code + file ops +
 # web search + memory/todo + its own custom peer/escalation tools, so we disable
 # the rest. This trims per-turn tool-schema tokens and removes the skills /
-# session_search guidance blocks. (Removing `delegation` also matches the soul,
-# which already tells agents delegate_task is disabled — use send_peer_message.)
+# session_search guidance blocks.
+#
+# delegate_task (the "delegation" toolset) is ENABLED for workers: a grindy
+# multi-step job (scraping, form-filling, bulk edits) run by a fresh-context
+# sub-agent costs ~10x less than running it in the parent's full history, since
+# every parent iteration re-bills the whole context. The old browser-collision
+# problem (concurrent sub-agents driving one shared tab) is fixed by
+# browser.fresh_tab_per_task (see write_agent_hermes_config) — each sub-agent's
+# unique task_id gets its own tab in the shared Chrome. Supervisors still have
+# it disabled (added per-daemon in agent._ensure_agent): they review and steer,
+# never execute.
 DISABLED_TOOLSETS: List[str] = [
     "session_search",  # cross-session search — unused; also drops its guidance block
-    "delegation",      # delegate_task — soul says disabled; peers via send_peer_message
     "tts",             # text_to_speech
     "image_gen", "video_gen", "video",  # media generation — not used
     "spotify", "homeassistant", "discord", "discord_admin",
@@ -479,6 +510,18 @@ SUPERVISOR_SWEEP_CHAR_CAP = int(os.environ.get("SWARM_SUPERVISOR_SWEEP_CHAR_CAP"
 # below readability.
 SUPERVISOR_SWEEP_PER_PEER_FLOOR = int(
     os.environ.get("SWARM_SUPERVISOR_SWEEP_PER_PEER_FLOOR", "2000"))
+# Idle-skip: when NO watched peer logged a single message since the last sweep,
+# skip queueing one (a skipped sweep costs ~6 SQL rows; a queued all-IDLE sweep
+# was measured at a full ~85k-token LLM turn). Never go silence-blind though —
+# the very failure the sweep design exists to catch is an idle agent OWING
+# work — so every MAX_IDLE_SKIPS-th consecutive idle interval forces a full
+# review anyway, and an open delegation older than FORCE_OPEN_AGE forces one
+# early (rate-limited to once per age window, so a permanently parked item
+# can't degenerate back to sweeping every interval).
+SUPERVISOR_SWEEP_MAX_IDLE_SKIPS = int(
+    os.environ.get("SWARM_SUPERVISOR_SWEEP_MAX_IDLE_SKIPS", "3"))
+SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS = int(
+    os.environ.get("SWARM_SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS", "7200"))
 # DEPRECATED — no longer read by the daemon; kept so old .env files don't error.
 SUPERVISOR_TOKEN_THRESHOLD = int(os.environ.get("SWARM_SUPERVISOR_TOKEN_THRESHOLD", "6000"))
 # Legacy single-review cap; still the default char_cap of _render_feed_transcript.
@@ -703,8 +746,8 @@ def write_agent_hermes_config(
     web_section["search_backend"] = WEB_SEARCH_BACKEND
     existing["web"] = web_section
 
-    # Apply the disabled-toolsets list (currently empty — delegate_task stays
-    # enabled; see DISABLED_TOOLSETS). Merge-safe with Hermes-seeded agent.* keys.
+    # Apply the disabled-toolsets list (see DISABLED_TOOLSETS for what and
+    # why). Merge-safe with Hermes-seeded agent.* keys.
     agent_section = existing.get("agent")
     if not isinstance(agent_section, dict):
         agent_section = {}
@@ -714,10 +757,12 @@ def write_agent_hermes_config(
         # otherwise just a request the model ignores (the saas overseer ran 57
         # terminal commands and joined the very loop it was meant to police).
         # Physically remove the action toolsets so a supervisor structurally CANNOT
-        # run commands, browse, execute code, or web-search. It keeps file-read,
-        # memory, and the swarm tools (send_peer_message, pause_agent, log_decision,
-        # ask_human) — everything oversight needs and nothing project work needs.
-        _disabled += [t for t in ("terminal", "browser", "code_execution", "web")
+        # run commands, browse, execute code, web-search, or spawn sub-agents. It
+        # keeps file-read, memory, and the swarm tools (send_peer_message,
+        # pause_agent, log_decision, ask_human) — everything oversight needs and
+        # nothing project work needs.
+        _disabled += [t for t in
+                      ("terminal", "browser", "code_execution", "web", "delegation")
                       if t not in _disabled]
     agent_section["disabled_toolsets"] = _disabled
     existing["agent"] = agent_section

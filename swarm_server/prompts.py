@@ -24,6 +24,10 @@ import json
 from typing import Any, Dict, List, Optional
 
 from swarm_server.config import (
+    LIVE_CTX_COMPLETED,
+    LIVE_CTX_DECISIONS,
+    LIVE_CTX_PEER_MESSAGES,
+    LIVE_CTX_TREE_MAX_ENTRIES,
     SWEEP_INTERVAL_SECONDS,
     _get_project_dir,
     _get_team_workspace_path,
@@ -186,12 +190,15 @@ background=true, then health-check it with a follow-up command.
    is multi-line: ONE call types a whole document (\n = real Enter), and
    from_file="docs/post.md" types a file's entire contents — NEVER type an
    article one paragraph per call.
-3. Hover-only menus → browser_hover. Reordering/sliders → browser_drag. File
+3. Already know the next 2-10 actions (click → type → press, fill a small
+   form)? ONE browser_steps call runs the whole sequence and stops at the
+   first failure — never spend N separate calls on a flow you can script.
+4. Hover-only menus → browser_hover. Reordering/sliders → browser_drag. File
    pickers → browser_upload (never click through the OS dialog). Slow
    saves/loads → browser_wait, not blind re-clicks.
-4. Visible on screen but NO usable ref (canvas, unlabeled icons, custom
+5. Visible on screen but NO usable ref (canvas, unlabeled icons, custom
    widgets)? browser_locate("describe it visually") → browser_click_xy(x,y).
-5. SEE before you claim: after any step that should visibly change the page,
+6. SEE before you claim: after any step that should visibly change the page,
    browser_screenshot (saved to your workspace — cite the path in your RESULT)
    or browser_vision to confirm it actually happened.
 The same action failing twice will not pass on try 3 — move DOWN the ladder.
@@ -210,9 +217,27 @@ Read it before re-trying anything; never hunt for an error with console scans.
 - Never type a secret into a site it wasn't stored for, and never paste
   secrets into messages, files, or logs.
 
+## Sub-agents for grindy work
+
+delegate_task spawns a fresh sub-agent that does a job and returns ONLY a
+summary — its tool calls never enter your context, which makes a long
+mechanical job ~10x cheaper there than in your own turn.
+- USE IT when a job is 5+ mechanical tool steps: scraping a list of pages,
+  filling repetitive forms, bulk file edits, a multi-page research sweep.
+- The sub-agent knows NOTHING about the team or mission — put everything it
+  needs (URLs, file paths, exact success criteria, what to return) in the
+  goal/context, pass narrow toolsets (e.g. ["browser","file"]), and set
+  max_iterations.
+- NEVER use it to talk to teammates (send_peer_message is the only channel) or
+  for judgment calls that need team state — those are yours.
+
 ## Economy
 
-- Batch independent tool calls into ONE turn — cost is per turn, not per call.
+- Batch independent tool calls into ONE assistant message — every extra
+  round trip re-sends your ENTIRE context to the model. Read 3 files? Three
+  tool calls in one message, not three turns.
+- 5+ known mechanical steps → ONE browser_steps / browser_keys(from_file) /
+  delegate_task call, never N separate round trips.
 - web_search to find information; the browser only to open a URL you already
   have.
 - Don't re-read a file you just wrote unless the next step needs its contents.
@@ -798,6 +823,64 @@ def strip_stale_live_context(text: str) -> str:
     return out
 
 
+# Marker prefix for an aged-out tool result. Doubles as the idempotency guard:
+# a stub starts with this and is far shorter than any min_chars threshold, so
+# it can never be re-stubbed.
+TOOL_RESULT_ELIDED_PREFIX = "[stale tool result elided"
+
+
+def age_stale_tool_results(
+    messages: List[Dict[str, Any]],
+    keep_recent: int,
+    min_chars: int,
+    quantum: int,
+) -> List[Dict[str, Any]]:
+    """Replace OLD, LARGE tool results in replayed history with one-line stubs.
+
+    Tool results are 50-60% of a working agent's history (measured), and every
+    LLM iteration re-bills the whole history — yet a 3-day-old browser snapshot
+    or file dump is almost never read again, and if it IS needed the agent can
+    just re-run the tool. Unlike compaction this deletes nothing the agent SAID
+    or DECIDED; assistant/user turns stay verbatim.
+
+    Rules:
+    - The most recent `keep_recent` messages are never touched (the working set).
+    - The cutoff is quantized: it only advances every `quantum` messages, so the
+      request prefix stays byte-stable between steps (provider prompt caches
+      survive ~quantum turns instead of busting every turn).
+    - Only role=="tool" messages with a str content longer than `min_chars` are
+      stubbed; the stub names the tool and original size so the model knows what
+      was there and how to get it back. tool_call_id/name fields are preserved
+      so pairing with the assistant's tool_calls stays intact.
+    - Idempotent; returns the original list object if nothing changed.
+    """
+    n = len(messages)
+    if n <= keep_recent or keep_recent < 0 or quantum <= 0:
+        return messages
+    cutoff = ((n - keep_recent) // quantum) * quantum
+    if cutoff <= 0:
+        return messages
+    out: List[Dict[str, Any]] = []
+    changed = False
+    for i, m in enumerate(messages):
+        if (
+            i < cutoff
+            and m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and len(m["content"]) > min_chars
+            and not m["content"].startswith(TOOL_RESULT_ELIDED_PREFIX)
+        ):
+            name = m.get("name") or "tool"
+            stub = (
+                f"{TOOL_RESULT_ELIDED_PREFIX} — {name}, was "
+                f"{len(m['content'])} chars; re-run the tool if you need it]"
+            )
+            m = {**m, "content": stub}
+            changed = True
+        out.append(m)
+    return out if changed else messages
+
+
 def compose_live_context(
     team_id: str,
     agent_id: str,
@@ -830,11 +913,11 @@ def compose_live_context(
         )
 
     brief = _read_workspace_brief(team_id)
-    tree = _build_workspace_tree(team_id)
-    recent = _recent_peer_messages(team_id, full_config, limit=10)
-    decisions = _recent_decisions(team_id, limit=20)
+    tree = _build_workspace_tree(team_id, max_entries=LIVE_CTX_TREE_MAX_ENTRIES)
+    recent = _recent_peer_messages(team_id, full_config, limit=LIVE_CTX_PEER_MESSAGES)
+    decisions = _recent_decisions(team_id, limit=LIVE_CTX_DECISIONS)
     delegations = _open_delegations_block(team_id, agent_id)
-    completed = _recently_completed_block(team_id, limit=8)
+    completed = _recently_completed_block(team_id, limit=LIVE_CTX_COMPLETED)
     humans = _waiting_on_human_block(team_id, full_config)
     crons = _build_cron_summary(full_config, agent_id)
     return (
@@ -849,9 +932,10 @@ def compose_live_context(
         "Shared project directory (every teammate works in this one tree — this is "
         "what already exists; read any path here directly):\n"
         f"{tree}\n\n"
-        "DECISION LOG — the team's last 20 decisions (oldest first). This is the "
-        "shared memory; check it before acting so you don't redo or contradict "
-        "settled work. Append to it with log_decision (one line, sparingly):\n"
+        f"DECISION LOG — the team's last {LIVE_CTX_DECISIONS} decisions (oldest "
+        "first). This is the shared memory; check it before acting so you don't "
+        "redo or contradict settled work. Append with log_decision (one line, "
+        "sparingly):\n"
         f"{decisions}\n\n"
         "OUTSTANDING WORK (delegation ledger — close items by sending a RESULT):\n"
         f"{delegations}\n\n"
@@ -860,7 +944,8 @@ def compose_live_context(
         f"{completed}\n\n"
         "WAITING ON HUMAN (unanswered ask_human/takeover requests across the team):\n"
         f"{humans}\n\n"
-        "Last 10 messages between teammates (send_peer_message), oldest first:\n"
+        f"Last {LIVE_CTX_PEER_MESSAGES} messages between teammates "
+        "(send_peer_message), oldest first:\n"
         f"{recent}\n\n"
         "Your scheduled cron wake-ups (manage with schedule_wakeup / cancel_wakeup):\n"
         f"{crons}\n"

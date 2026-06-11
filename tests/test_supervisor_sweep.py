@@ -94,12 +94,16 @@ def make_supervisor(peers, interval_minutes=None, state="idle", pending=0,
     sup._sup_watermark = {}
     sup._last_sweep_ts = time.time() - (last_sweep_ago
                                         if last_sweep_ago is not None else 10 ** 6)
+    sup._last_sweep_check_ts = 0.0
+    sup._sup_idle_skips = 0
+    sup._last_delegation_force_ts = 0.0
     sup.ingested = []
     sup.ingest_task = lambda frm, payload: sup.ingested.append((frm, payload))
     # bind the real methods under test
     for meth in ("_maybe_feed_supervisor", "_supervisor_interval_seconds",
                  "_render_feed_transcript", "_assess_peer_progress",
-                 "_peer_runtime_state", "_sweep_ledger"):
+                 "_peer_runtime_state", "_sweep_ledger",
+                 "_oldest_open_delegation_age"):
         setattr(sup, meth, getattr(AgentDaemon, meth).__get__(sup))
     sup._norm_msg = AgentDaemon._norm_msg  # staticmethod — do not bind
     sup._NONACTION_TOOLS = AgentDaemon._NONACTION_TOOLS
@@ -140,6 +144,7 @@ def test_sweep_waits_for_interval(monkeypatch, no_registry):
     db = FakeDB({"a": [msg(1, "did things")]})
     monkeypatch.setattr(agent_mod, "monitor_db", db)
     sup = make_supervisor(["a"], interval_minutes=10, last_sweep_ago=60)
+    sup._sup_watermark = {"a": 0}      # known peer with unseen activity
     sup._maybe_feed_supervisor()
     assert sup.ingested == []          # only 60s elapsed of a 600s interval
 
@@ -200,15 +205,18 @@ def test_first_seen_peer_anchors_to_now_not_history(monkeypatch, no_registry):
     monkeypatch.setattr(agent_mod, "monitor_db", db)
     sup = make_supervisor(["a"])
     sup._maybe_feed_supervisor()
-    _, prompt = sup.ingested[0]
-    assert "ancient history" not in prompt          # anchored, not dumped
-    assert "NO ACTIVITY" in prompt
-    assert sup._sup_watermark["a"] == 2
+    # First sight anchors the watermark and SKIPS — no all-idle LLM turn.
+    assert sup.ingested == []
+    assert sup._sup_watermark["a"] == 2              # anchored, not dumped
+    assert [a for a, k in db.events if a[1] == "supervisor_sweep_skipped"]
 
     db.msgs["a"].append(msg(3, "fresh work after anchor"))
     sup._last_sweep_ts = time.time() - 10 ** 6
+    sup._last_sweep_check_ts = 0.0
     sup._maybe_feed_supervisor()
-    assert "fresh work after anchor" in sup.ingested[1][1]
+    prompt = sup.ingested[0][1]
+    assert "fresh work after anchor" in prompt
+    assert "ancient history" not in prompt           # pre-anchor never dumped
     assert sup._sup_watermark["a"] == 3              # advanced after enqueue
 
 
@@ -297,6 +305,101 @@ def test_age_short():
     assert _age_short(59) == "0m"
     assert _age_short(47 * 60) == "47m"
     assert _age_short(3 * 3600 + 12 * 60) == "3h12m"
+
+
+# ---------------------------------------------------------------------------
+# 7. Idle-skip — no peer activity → no sweep turn (but never silence-blind)
+# ---------------------------------------------------------------------------
+
+def _due(sup):
+    """Make both sweep clocks long overdue so the next call probes."""
+    sup._last_sweep_ts = time.time() - 10 ** 6
+    sup._last_sweep_check_ts = 0.0
+
+
+def test_idle_sweep_skipped_logs_event_and_preserves_window(monkeypatch, no_registry):
+    db = FakeDB({"a": [msg(1, "old, already seen")]})
+    monkeypatch.setattr(agent_mod, "monitor_db", db)
+    sup = make_supervisor(["a"])
+    sup._sup_watermark = {"a": 1}                  # nothing new since
+    before = sup._last_sweep_ts
+    sup._maybe_feed_supervisor()
+    assert sup.ingested == []                      # no LLM turn queued
+    assert sup._last_sweep_ts == before            # window anchor intact
+    assert sup._sup_watermark == {"a": 1}          # watermark untouched
+    assert sup._sup_idle_skips == 1
+    skips = [(a, k) for a, k in db.events if a[1] == "supervisor_sweep_skipped"]
+    assert len(skips) == 1
+    assert skips[0][1]["data"]["consecutive_skips"] == 1
+    assert db.queried == []                        # no transcript content pulled
+
+
+def test_skip_sets_check_clock_no_immediate_recheck(monkeypatch, no_registry):
+    db = FakeDB({"a": []})
+    monkeypatch.setattr(agent_mod, "monitor_db", db)
+    sup = make_supervisor(["a"])
+    sup._sup_watermark = {"a": 0}
+    sup._maybe_feed_supervisor()
+    assert sup._sup_idle_skips == 1
+    sup._maybe_feed_supervisor()                   # immediately again
+    assert sup._sup_idle_skips == 1                # gated — no second skip yet
+
+
+def test_idle_backstop_forces_nth_sweep(monkeypatch, no_registry):
+    db = FakeDB({"a": []})
+    monkeypatch.setattr(agent_mod, "monitor_db", db)
+    sup = make_supervisor(["a"])
+    sup._sup_watermark = {"a": 0}
+    max_skips = agent_mod.SUPERVISOR_SWEEP_MAX_IDLE_SKIPS
+    for i in range(max_skips):
+        _due(sup)
+        sup._maybe_feed_supervisor()
+    # Skips 1..N-1 were silent; the Nth idle interval forced a full review.
+    assert len(sup.ingested) == 1
+    assert "NO ACTIVITY" in sup.ingested[0][1]
+    assert sup._sup_idle_skips == 0                # counter reset
+    forced = [k["data"].get("forced") for a, k in db.events
+              if a[1] == "supervisor_sweep"]
+    assert forced == ["idle_backstop"]
+
+
+def test_stale_delegation_forces_once_per_window(monkeypatch, no_registry):
+    now = time.time()
+    db = FakeDB({"a": []}, open_delegations=[
+        {"msg_id": "deadbeef", "from_agent": "overseer", "to_agent": "a",
+         "summary": "stuck task", "timestamp":
+             now - agent_mod.SUPERVISOR_SWEEP_FORCE_OPEN_AGE_SECONDS - 60}])
+    monkeypatch.setattr(agent_mod, "monitor_db", db)
+    sup = make_supervisor(["a"])
+    sup._sup_watermark = {"a": 0}
+    sup._maybe_feed_supervisor()
+    # The overdue delegation forces an early review despite zero activity.
+    assert len(sup.ingested) == 1
+    forced = [k["data"].get("forced") for a, k in db.events
+              if a[1] == "supervisor_sweep"]
+    assert forced == ["stale_delegation"]
+    # Still idle next interval: the same parked item must NOT force again.
+    _due(sup)
+    sup._maybe_feed_supervisor()
+    assert len(sup.ingested) == 1                  # skipped this time
+    assert sup._sup_idle_skips >= 1
+
+
+def test_activity_after_skips_is_gapless(monkeypatch, no_registry):
+    db = FakeDB({"a": [msg(1, "seen already")]})
+    monkeypatch.setattr(agent_mod, "monitor_db", db)
+    sup = make_supervisor(["a"])
+    sup._sup_watermark = {"a": 1}
+    sup._maybe_feed_supervisor()                   # idle → skip
+    assert sup.ingested == []
+
+    db.msgs["a"].append(msg(2, "woke up and did things"))
+    _due(sup)
+    sup._maybe_feed_supervisor()
+    assert len(sup.ingested) == 1
+    assert "woke up and did things" in sup.ingested[0][1]
+    assert sup._sup_idle_skips == 0                # reset by the real sweep
+    assert sup._sup_watermark["a"] == 2
 
 
 # ---------------------------------------------------------------------------
