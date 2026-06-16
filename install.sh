@@ -7,6 +7,11 @@
 # otherwise launching `hermes setup` (which also covers custom / OpenAI-compatible
 # endpoints). Idempotent: safe to re-run.
 #
+# On a fresh machine it auto-installs missing OS prerequisites (git, Python's
+# venv module) via the system package manager — using sudo only when that needs
+# no password; otherwise it prints the exact command and stops. It never removes
+# or replaces your system Python.
+#
 # Works two ways:
 #   • from a clone:   bash install.sh
 #   • from the web:   bash <(curl -fsSL <raw-url>/install.sh)     # clones first
@@ -29,7 +34,7 @@
 #
 set -euo pipefail
 
-usage() { sed -n '2,28p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; }
+usage() { sed -n '2,33p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; }
 
 # ---- pretty output --------------------------------------------------------
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; X=$'\e[0m'; else B= G= Y= R= X=; fi
@@ -48,6 +53,55 @@ for a in "$@"; do case "$a" in
   *)            die "unknown option: $a  (try --help)" ;;
 esac; done
 
+# ---- system packages (git, python venv) on a fresh machine ----------------
+# A clean OS often lacks git and/or Python's venv module. Auto-install them via
+# the OS package manager when we can do so unattended (root, or passwordless
+# sudo) — otherwise print the exact command and stop. We never run a sudo that
+# could block on a password prompt (that would hang a non-interactive install).
+_PKG=""; _PKG_UPDATE=""        # filled by _pkg_setup; empty ⇒ can't auto-install
+_pkg_setup() {
+  local s=""
+  if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then s="sudo "; else return; fi
+  fi
+  if   command -v apt-get >/dev/null 2>&1; then _PKG="${s}apt-get install -y -q"; _PKG_UPDATE="${s}apt-get update -qq"
+  elif command -v dnf     >/dev/null 2>&1; then _PKG="${s}dnf install -y"
+  elif command -v yum     >/dev/null 2>&1; then _PKG="${s}yum install -y"
+  elif command -v pacman  >/dev/null 2>&1; then _PKG="${s}pacman -S --noconfirm"
+  elif command -v zypper  >/dev/null 2>&1; then _PKG="${s}zypper --non-interactive install"
+  elif command -v apk     >/dev/null 2>&1; then _PKG="${s}apk add"
+  elif command -v brew    >/dev/null 2>&1; then _PKG="brew install"
+  fi
+}
+_pkg_setup
+
+ensure_git() {
+  command -v git >/dev/null 2>&1 && return 0
+  if [ -n "$_PKG" ]; then
+    info "git not found — installing it…"
+    [ -n "$_PKG_UPDATE" ] && $_PKG_UPDATE >/dev/null 2>&1 || true
+    $_PKG git >/dev/null 2>&1 || true
+  fi
+  command -v git >/dev/null 2>&1 && { info "git installed."; return 0; }
+  die "git is required to fetch hermes-swarm. Install it (e.g. sudo apt install git) and retry."
+}
+
+# Ensure "$PYBIN -m venv" works (Debian/Ubuntu split it into python3-venv).
+ensure_py_venv() {
+  "$PYBIN" -c 'import ensurepip, venv' >/dev/null 2>&1 && return 0
+  local pyver pkg
+  pyver="$("$PYBIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo 3)"
+  if [ -n "$_PKG" ]; then
+    [ -n "$_PKG_UPDATE" ] && $_PKG_UPDATE >/dev/null 2>&1 || true
+    for pkg in "python${pyver}-venv" python3-venv; do
+      info "Python venv module missing — installing $pkg…"
+      $_PKG "$pkg" >/dev/null 2>&1 || continue
+      "$PYBIN" -c 'import ensurepip, venv' >/dev/null 2>&1 && { info "venv module ready."; return 0; }
+    done
+  fi
+  die "Python's venv module is unavailable. Install it (e.g. sudo apt install python3-venv) and retry — or use Docker: docker compose up --build"
+}
+
 # ---- Locate or fetch the repo --------------------------------------------
 # Run from a checkout → use it. Piped from the web (no checkout) → clone first,
 # then continue from inside the clone.
@@ -61,7 +115,7 @@ if [ -n "$_self_dir" ] && _in_repo "$_self_dir"; then
 elif _in_repo "$PWD"; then
   :                                                # already inside a checkout
 else
-  command -v git >/dev/null 2>&1 || die "git is required to fetch hermes-swarm — install it and retry."
+  ensure_git                                        # auto-installs git on a fresh machine
   TARGET="${HERMES_SWARM_DIR:-$PWD/hermes-swarm}"
   if _in_repo "$TARGET"; then
     step "Updating existing clone at $TARGET"
@@ -81,7 +135,7 @@ case "$(uname -s)" in
 esac
 
 find_python() {
-  for c in python3.13 python3.12 python3.11 python3 python; do
+  for c in python3.14 python3.13 python3.12 python3.11 python3 python; do
     command -v "$c" >/dev/null 2>&1 || continue
     "$c" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null \
       && { command -v "$c"; return 0; }
@@ -97,7 +151,10 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
   VENV="$VIRTUAL_ENV"; info "Using the active venv: $VENV"
 else
   VENV="$PWD/.venv"
-  [ -d "$VENV" ] || "$PYBIN" -m venv "$VENV"
+  if [ ! -d "$VENV" ]; then
+    ensure_py_venv                                  # auto-installs python3-venv if missing
+    "$PYBIN" -m venv "$VENV"
+  fi
   info "venv: $VENV"
 fi
 PY="$VENV/bin/python"
