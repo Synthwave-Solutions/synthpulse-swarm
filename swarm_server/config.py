@@ -1719,6 +1719,24 @@ def add_agent_cron(
         if a is None:
             raise ValueError(f"Agent '{name}' not found")
         crons = a.setdefault("crons", [])
+        # Dedup: collapse an identical, still-active wake-up instead of stacking a
+        # duplicate. Agents re-issue the same schedule_wakeup across turns (they
+        # don't see their own cron list as state), which otherwise piles up N
+        # copies of one job that all fire — the runaway we saw with the outreach
+        # exec (3x the same one-shot). Match on (schedule, instruction); only
+        # against ENABLED crons so re-arming a finished/disabled one-shot still
+        # works. Idempotent: return the existing entry as if freshly created.
+        _key = (norm, (instruction or "").strip())
+        for _c in crons:
+            if not _c.get("enabled", True):
+                continue
+            if (_c.get("schedule"), (_c.get("instruction") or "").strip()) == _key:
+                log.info(
+                    "[config] cron dedup: '%s' already has an active wake-up for "
+                    "schedule=%s — returning existing %s instead of duplicating",
+                    name, norm, _c.get("id"),
+                )
+                return _c
         if len(crons) >= MAX_CRONS_PER_AGENT:
             raise ValueError(f"Cron limit reached ({MAX_CRONS_PER_AGENT}). Delete one first.")
         crons.append(entry)

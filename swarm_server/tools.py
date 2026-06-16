@@ -1322,11 +1322,31 @@ def _schedule_wakeup_handler(args: dict, **kwargs) -> str:
     max_runs = args.get("max_runs")
     if max_runs in ("", None):
         max_runs = None
+    # Snapshot existing cron ids so we can tell whether add_agent_cron actually
+    # created one or collapsed a duplicate (it returns the pre-existing entry).
+    _prior_ids = {c.get("id") for c in cfg["agents"][caller].get("crons", [])}
     try:
         entry = add_agent_cron(cfg, caller, schedule, instruction,
                                created_by="agent", max_runs=max_runs)
     except ValueError as e:
         return json.dumps({"success": False, "error": str(e)})
+
+    # Idempotent re-schedule: the agent already has this exact wake-up active.
+    # Tell it so plainly (don't log a phantom cron_created) so it stops re-issuing
+    # and moves on instead of stacking duplicates.
+    if entry.get("id") in _prior_ids:
+        return json.dumps({
+            "success": True,
+            "deduplicated": True,
+            "cron_id": entry["id"],
+            "schedule": entry["schedule"],
+            "max_runs": entry.get("max_runs"),
+            "message": (
+                f"You already have an active wake-up for this schedule "
+                f"({cron_describe(entry['schedule'])}) — kept the existing one, "
+                "did not create a duplicate. No further action needed."
+            ),
+        })
 
     reload_daemon_crons(caller)
     nxt = None

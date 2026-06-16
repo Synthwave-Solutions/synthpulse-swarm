@@ -35,7 +35,7 @@ Each path ends with the dashboard on **http://127.0.0.1:8000**.
 ### One line — macOS & Linux
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/CyberTron957/logios-orchestrator/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/CyberTron957/hermes-mission-control/main/install.sh)
 ```
 
 That clones the repo, sets up a local `.venv`, installs everything, fetches a

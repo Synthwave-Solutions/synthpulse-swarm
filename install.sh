@@ -46,7 +46,7 @@ esac; done
 # ---- Locate or fetch the repo --------------------------------------------
 # Run from a checkout → use it. Piped from the web (no checkout) → clone first,
 # then continue from inside the clone.
-REPO_URL="${HERMES_SWARM_REPO:-https://github.com/CyberTron957/logios-orchestrator.git}"
+REPO_URL="${HERMES_SWARM_REPO:-https://github.com/CyberTron957/hermes-mission-control.git}"
 _in_repo() { [ -f "$1/pyproject.toml" ] && grep -q 'name *= *"hermes-swarm"' "$1/pyproject.toml" 2>/dev/null; }
 
 _self_dir=""

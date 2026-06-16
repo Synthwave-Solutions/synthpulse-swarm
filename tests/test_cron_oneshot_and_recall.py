@@ -58,6 +58,40 @@ def test_add_cron_rejects_bad_max_runs(fake_config):
         add_agent_cron(fake_config, "founder", "0 9 * * *", "x", max_runs=-3)
 
 
+def _distinct_cron_ids(fake_config):
+    # The test fixture aliases load_agents_config() to the same dict the caller
+    # holds, so add_agent_cron's belt-and-suspenders double-write lands twice in
+    # one list (in production the two writes hit different objects). Count
+    # *distinct* ids to assert on real cron identity regardless of that artifact.
+    return {c["id"] for c in fake_config["agents"]["founder"]["crons"]}
+
+
+def test_add_cron_dedups_identical_active_wakeup(fake_config):
+    # Same schedule + instruction issued twice -> one cron, not two (agents
+    # re-issue schedule_wakeup across turns and would otherwise stack copies).
+    e1 = add_agent_cron(fake_config, "founder", "0 10 18 6 *", "send email 2", max_runs=1)
+    e2 = add_agent_cron(fake_config, "founder", "0 10 18 6 *", "send email 2", max_runs=1)
+    assert e2["id"] == e1["id"]
+    assert _distinct_cron_ids(fake_config) == {e1["id"]}
+
+
+def test_add_cron_same_schedule_different_instruction_not_deduped(fake_config):
+    # Distinct tasks that merely share a send time are legitimately separate.
+    a = add_agent_cron(fake_config, "founder", "0 10 18 6 *", "Campaign 01 Email 2", max_runs=1)
+    b = add_agent_cron(fake_config, "founder", "0 10 18 6 *", "Campaign 02 Email 2", max_runs=1)
+    assert a["id"] != b["id"]
+    assert _distinct_cron_ids(fake_config) == {a["id"], b["id"]}
+
+
+def test_add_cron_redups_after_disable(fake_config):
+    # A finished/disabled one-shot does not block re-arming the same wake-up.
+    e1 = add_agent_cron(fake_config, "founder", "0 9 * * *", "one-time", max_runs=1)
+    record_cron_fire("founder", e1["id"])  # completes -> enabled=False
+    e2 = add_agent_cron(fake_config, "founder", "0 9 * * *", "one-time", max_runs=1)
+    assert e2["id"] != e1["id"]
+    assert {e1["id"], e2["id"]} <= _distinct_cron_ids(fake_config)
+
+
 def test_record_cron_fire_oneshot_completes_and_disables(fake_config):
     entry = add_agent_cron(fake_config, "founder", "0 9 * * *", "one-time", max_runs=1)
     res = record_cron_fire("founder", entry["id"])
