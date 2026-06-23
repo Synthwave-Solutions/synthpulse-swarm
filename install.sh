@@ -53,11 +53,12 @@ for a in "$@"; do case "$a" in
   *)            die "unknown option: $a  (try --help)" ;;
 esac; done
 
-# ---- system packages (git, python venv) on a fresh machine ----------------
-# A clean OS often lacks git and/or Python's venv module. Auto-install them via
-# the OS package manager when we can do so unattended (root, or passwordless
-# sudo) — otherwise print the exact command and stop. We never run a sudo that
-# could block on a password prompt (that would hang a non-interactive install).
+# ---- system packages (git, python venv, curl/wget) on a fresh machine -------
+# A clean OS often lacks git, Python's venv module, curl, or wget. Auto-install
+# them via the OS package manager when we can do so unattended (root, or
+# passwordless sudo) — otherwise print the exact command and stop. We never run
+# a sudo that could block on a password prompt (that would hang a non-interactive
+# install).
 _PKG=""; _PKG_UPDATE=""        # filled by _pkg_setup; empty ⇒ can't auto-install
 _pkg_setup() {
   local s=""
@@ -75,15 +76,32 @@ _pkg_setup() {
 }
 _pkg_setup
 
+_pkg_install() {
+  # _pkg_install <pkg> [pkg2 ...] — install OS packages if possible
+  [ -z "$_PKG" ] && return 1
+  [ -n "$_PKG_UPDATE" ] && $_PKG_UPDATE >/dev/null 2>&1 || true
+  $_PKG "$@" >/dev/null 2>&1
+}
+
 ensure_git() {
   command -v git >/dev/null 2>&1 && return 0
   if [ -n "$_PKG" ]; then
     info "git not found — installing it…"
-    [ -n "$_PKG_UPDATE" ] && $_PKG_UPDATE >/dev/null 2>&1 || true
-    $_PKG git >/dev/null 2>&1 || true
+    _pkg_install git || true
   fi
   command -v git >/dev/null 2>&1 && { info "git installed."; return 0; }
   die "git is required to fetch hermes-swarm. Install it (e.g. sudo apt install git) and retry."
+}
+
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  command -v wget >/dev/null 2>&1 && return 0
+  if [ -n "$_PKG" ]; then
+    info "curl/wget not found — installing curl…"
+    _pkg_install curl || true
+  fi
+  command -v curl >/dev/null 2>&1 && { info "curl installed."; return 0; }
+  warn "Neither curl nor wget available — pip bootstrap may fail if needed."
 }
 
 # Ensure "$PYBIN -m venv" works (Debian/Ubuntu split it into python3-venv).
@@ -120,6 +138,7 @@ elif _in_repo "$PWD"; then
   :                                                # already inside a checkout
 else
   ensure_git                                        # auto-installs git on a fresh machine
+  ensure_curl                                       # auto-installs curl on a fresh machine
   TARGET="${HERMES_SWARM_DIR:-$PWD/hermes-swarm}"
   if _in_repo "$TARGET"; then
     step "Updating existing clone at $TARGET"
@@ -198,15 +217,36 @@ if [ "$NO_BROWSER" -eq 0 ]; then
   if "$PY" -c 'import sys; from swarm_server.browser_pool import _find_browser; sys.exit(0 if _find_browser() else 1)' 2>/dev/null; then
     info "Found a usable Chrome/Chromium — skipping the download."
   else
-    # The `playwright` Python package isn't always pulled in by hermes-agent[all];
-    # make sure it's importable before we ask it to fetch a browser.
-    if ! "$PY" -c 'import playwright' 2>/dev/null; then
-      info "Installing the playwright package…"
-      "$PY" -m pip install --quiet playwright || warn "couldn't install playwright."
+    # Try installing system Chromium first (fastest, no download needed)
+    _chromium_installed=0
+    if command -v chromium-browser >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1; then
+      info "System Chromium found — using it."
+      _chromium_installed=1
+    elif [ -n "$_PKG" ]; then
+      info "No system Chrome found — attempting to install chromium via package manager…"
+      _pkg_install chromium-browser chromium 2>/dev/null && _chromium_installed=1 || true
+      if [ "$_chromium_installed" -eq 1 ]; then
+        info "System Chromium installed."
+      fi
     fi
-    info "No system Chrome found — downloading Playwright Chromium…"
-    "$PY" -m playwright install chromium \
-      || warn "Chromium install failed; browser tools will be unavailable (everything else works)."
+
+    # Fall back to Playwright Chromium download
+    if [ "$_chromium_installed" -eq 0 ]; then
+      # The `playwright` Python package isn't always pulled in by hermes-agent[all];
+      # make sure it's importable before we ask it to fetch a browser.
+      if ! "$PY" -c 'import playwright' 2>/dev/null; then
+        info "Installing the playwright package…"
+        "$PY" -m pip install --quiet playwright || warn "couldn't install playwright."
+      fi
+      info "Downloading Playwright Chromium (with system dependencies)…"
+      # --with-deps installs OS libraries Chromium needs (libnss, libatk, etc.)
+      # If --with-deps fails (e.g. broken repos), try without deps as last resort
+      if ! "$PY" -m playwright install --with-deps chromium 2>/dev/null; then
+        warn "Playwright --with-deps failed; trying without system deps…"
+        "$PY" -m playwright install chromium \
+          || warn "Chromium install failed; browser tools will be unavailable (everything else works)."
+      fi
+    fi
   fi
 else
   warn "--no-browser: skipping Chromium (browser tools will be unavailable)."
