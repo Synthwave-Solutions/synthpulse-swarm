@@ -341,6 +341,12 @@ TOOL_RESULT_AGE_KEEP_MESSAGES = int(os.environ.get("SWARM_TOOL_RESULT_AGE_KEEP_M
 TOOL_RESULT_AGE_MIN_CHARS = int(os.environ.get("SWARM_TOOL_RESULT_AGE_MIN_CHARS", "600"))
 TOOL_RESULT_AGE_QUANTUM = int(os.environ.get("SWARM_TOOL_RESULT_AGE_QUANTUM", "20"))
 
+# Opt-in: at `hermes-swarm up`, if a newer version is on `main`, upgrade in place
+# and re-exec BEFORE agents start (never interrupts in-flight work). Off by default;
+# no-op inside Docker (the image is rebuilt instead). See swarm_server/update_check.py.
+AUTO_UPDATE_ENABLED = os.environ.get(
+    "SWARM_AUTO_UPDATE", "0").lower() not in ("0", "false", "no", "")
+
 # Supervisor counterpart: a supervisor's history is dominated by its own past
 # sweep PAYLOADS (user-side team feeds — measured 96% of one overseer's session
 # chars), which tool-result aging never touches. At replay, all but the last

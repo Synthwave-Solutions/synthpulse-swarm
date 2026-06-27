@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from swarm_server import __version__
 from swarm_server.agent import AgentDaemon
 from swarm_server.config import (
     AGENTS,
@@ -235,7 +236,7 @@ async def lifespan(app: FastAPI):
         log.info("[Shutdown] All sweep tasks cancelled")
 
 
-app = FastAPI(title="Hermes Swarm Server", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Hermes Swarm Server", version=__version__, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -250,7 +251,7 @@ app.add_middleware(
 # itself (so the login UI can render), the load-balancer health probe, and the
 # self-reporting auth probe the dashboard hits at boot. None of these has a
 # mutating handler, so exempting them by exact path (any method) is safe.
-AUTH_EXEMPT_PATHS = {"/", "/health", "/auth/check"}
+AUTH_EXEMPT_PATHS = {"/", "/health", "/auth/check", "/version/check"}
 
 # Application-defined WebSocket close code for an unauthenticated socket
 # (4000-4999 is the private-use range). The dashboard re-opens the login modal
@@ -1915,6 +1916,18 @@ async def health(request: Request):
         "queue_depth": queue_depth,
         "llm_backend_ok": _backend_reachable_cached(),
     }
+
+
+@app.get("/version/check")
+async def version_check(force: bool = False):
+    """Report whether a newer version is on `main` and how to upgrade.
+
+    Auth-exempt (like /health) so the dashboard can call it pre-login. The check
+    is cached (~6h) and reads GitHub off the event loop, so this never blocks.
+    """
+    from swarm_server.update_check import check_for_update
+
+    return await asyncio.to_thread(check_for_update, force)
 
 
 @app.get("/auth/check")

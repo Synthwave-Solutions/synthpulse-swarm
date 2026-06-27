@@ -98,8 +98,39 @@ def print_banner() -> None:
         print(BANNER)
 
 
+def _maybe_auto_update() -> None:
+    """Opt-in startup auto-update: pull `main` + reinstall, then re-exec.
+
+    Runs only when SWARM_AUTO_UPDATE is set, before agents start, so it never
+    interrupts in-flight work. No-op inside Docker (rebuild the image instead).
+    Guarded by SWARM_DID_AUTOUPDATE so a failed/again-stale check can't re-exec
+    in a loop.
+    """
+    from swarm_server.config import AUTO_UPDATE_ENABLED
+
+    if not AUTO_UPDATE_ENABLED or os.environ.get("SWARM_DID_AUTOUPDATE"):
+        return
+    try:
+        from swarm_server.update_check import check_for_update
+
+        info = check_for_update(force=True)
+        if info["install_method"] == "docker" or not info["update_available"]:
+            return
+        print(f"● auto-update: {info['current']} → {info['latest']} (SWARM_AUTO_UPDATE)")
+        if _run_upgrade() != 0:
+            print("auto-update failed; starting the current version.", file=sys.stderr)
+            return
+        # Re-exec the upgraded code in place. The marker prevents a re-exec loop.
+        print("● restarting with the updated version…")
+        os.environ["SWARM_DID_AUTOUPDATE"] = "1"
+        os.execv(sys.executable, [sys.executable, "-m", "swarm_server.cli", *sys.argv[1:]])
+    except Exception as e:  # never let auto-update block a normal start
+        print(f"auto-update skipped ({e}); starting the current version.", file=sys.stderr)
+
+
 def cmd_up(args) -> int:
     """Run the server — in the foreground, or detached with `--detach`."""
+    _maybe_auto_update()
     print_banner()
     if getattr(args, "detach", False):
         return _start_detached(args)
@@ -485,6 +516,86 @@ def cmd_set_model(args) -> int:
     return 0
 
 
+def _run_upgrade() -> int:
+    """Pull `main` and reinstall in place. Returns 0 on success, non-zero on failure.
+
+    Used by both `hermes-swarm update` and the opt-in startup auto-update. Runs
+    subprocesses with arg lists (no shell-string interpolation) targeting THIS
+    interpreter's environment via `sys.executable -m pip`.
+    """
+    import subprocess
+
+    from swarm_server.config import PROJECT_ROOT
+
+    print(f"→ git pull --ff-only  ({PROJECT_ROOT})")
+    rc = subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "pull", "--ff-only"]
+    ).returncode
+    if rc != 0:
+        print("✗ git pull failed (uncommitted changes or diverged branch?). "
+              "Resolve manually, then retry.", file=sys.stderr)
+        return rc
+
+    print(f"→ pip install -e .  ({sys.executable})")
+    rc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", str(PROJECT_ROOT)]
+    ).returncode
+    if rc != 0:
+        print("✗ pip reinstall failed.", file=sys.stderr)
+        return rc
+    return 0
+
+
+def cmd_update(args) -> int:
+    """Upgrade this install to the version on `main` (git pull + reinstall)."""
+    from swarm_server.update_check import check_for_update
+
+    info = check_for_update(force=True)
+    current, latest = info["current"], info.get("latest")
+    method = info["install_method"]
+
+    print(f"  current: {current}")
+    print(f"  latest:  {latest or '(could not reach GitHub)'}")
+
+    if method == "docker":
+        print("\nThis is a Docker install — the running container can't update itself.")
+        print("Rebuild the image instead:")
+        print(f"  {info['upgrade_hint']}")
+        return 0
+
+    if latest is None:
+        print("\nCouldn't determine the latest version (network?). Try again later.",
+              file=sys.stderr)
+        return 1
+
+    if not info["update_available"]:
+        print("\n✓ Already up to date.")
+        return 0
+
+    if method == "unknown":
+        print("\n⚠ Couldn't confirm this is a git checkout — the upgrade path "
+              "(git pull + pip install -e .) may not apply to your install.")
+
+    if getattr(args, "check", False):
+        print(f"\nUpdate available → {latest}. Run `hermes-swarm update` to install.")
+        return 0
+
+    if not getattr(args, "yes", False):
+        try:
+            ans = input(f"\nUpdate {current} → {latest}? [Y/n] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("", "y", "yes"):
+            print("Aborted.")
+            return 0
+
+    rc = _run_upgrade()
+    if rc == 0:
+        print(f"\n✓ Updated to {latest}. Verify with: hermes-swarm doctor")
+        print("  Restart a running server for the new version to take effect.")
+    return rc
+
+
 def main(argv=None) -> int:
     _setup_logging()
     p = argparse.ArgumentParser(
@@ -514,6 +625,13 @@ def main(argv=None) -> int:
 
     doc = sub.add_parser("doctor", help="Check Hermes, model backend, and Chromium")
     doc.set_defaults(func=cmd_doctor)
+
+    upd = sub.add_parser("update", help="Update to the latest version on `main` (git pull + reinstall)")
+    upd.add_argument("--check", action="store_true",
+        help="only report whether an update is available; don't install")
+    upd.add_argument("-y", "--yes", action="store_true",
+        help="install without the confirmation prompt")
+    upd.set_defaults(func=cmd_update)
 
     init = sub.add_parser("init", help="Scaffold a starter team")
     init.add_argument("--team", default="default", help="team id (slug)")
