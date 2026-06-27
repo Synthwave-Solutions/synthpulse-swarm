@@ -1,7 +1,8 @@
 services:
   swarm:
     build: .
-    image: hermes-swarm:latest
+    image: ghcr.io/synthwave-solutions/synthpulse-swarm:latest
+    container_name: synthpulse-swarm
     env_file:
       # Optional: provider keys / SWARM_API_KEY etc. A fresh clone has no .env
       # (it's gitignored) — `required: false` lets `docker compose up` work

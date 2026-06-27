@@ -1,16 +1,16 @@
-# Deploying Hermes Swarm on a VPS (or any always-on host)
+# Deploying SynthPulse Swarm on a VPS (or any always-on host)
 
-Hermes Swarm is built to run **24/7, unattended**. This guide covers a hardened
-self-hosted setup. Read the threat model first — it determines everything else.
+SynthPulse Swarm is built to run **24/7, unattended**. This guide covers a hardened
+self-hosted setup. Read the threat model first, it determines everything else.
 
 ## Threat model (read this)
 
 Each agent is a full Hermes agent: it can **run terminal commands, read/write
-files, and drive a browser** — all as the OS user the server runs as. That power
+files, and drive a browser**, all as the OS user the server runs as. That power
 is the point (agents ship real work), but it means:
 
 - **Anyone who can reach the API can make agents act.** There is no per-user
-  permission model — it's a single trust boundary. Protect it.
+  permission model, it's a single trust boundary. Protect it.
 - **An agent that goes off the rails runs with your server user's privileges.**
   Contain the blast radius (dedicated user, or Docker).
 
@@ -25,10 +25,10 @@ Two consequences drive the rest of this doc:
 
 ---
 
-## Option A — Docker behind a TLS reverse proxy (recommended)
+## Option A, Docker behind a TLS reverse proxy (recommended)
 
 The image bundles Python, Hermes, Chromium and the dashboard, and runs the
-agents inside the container — so their terminal access is contained.
+agents inside the container, so their terminal access is contained.
 
 ```bash
 git clone <repo> hermes-swarm && cd hermes-swarm
@@ -50,7 +50,7 @@ swarm.example.com {
 ```
 
 Caddy auto-provisions HTTPS. WebSockets pass through `reverse_proxy` with no
-extra config. nginx equivalent (the `Upgrade`/`Connection` headers matter — the
+extra config. nginx equivalent (the `Upgrade`/`Connection` headers matter, the
 live execution view and the browser handover are WebSockets):
 
 ```nginx
@@ -72,11 +72,11 @@ Then `docker compose up -d --build`. Open `https://swarm.example.com`, enter the
 API key when prompted.
 
 > **Firewall:** allow 80/443 only. Keep 8000 (and any local LLM endpoint) bound
-> to localhost / the Docker network — never the public interface.
+> to localhost / the Docker network, never the public interface.
 
 ---
 
-## Option B — bare metal with systemd
+## Option B, bare metal with systemd
 
 For a host where Docker isn't an option. Contain the agents with a dedicated
 user; `deploy/hermes-swarm.service` adds systemd sandboxing on top.
@@ -121,16 +121,16 @@ finalizer drains agents and flushes browser cookies on `systemctl stop`.
 ## Operating it 24/7
 
 - **Budgets.** Set a per-team daily spend cap from the dashboard (click the
-  cost badge). When a team hits it, its agents pause — work is **held, not
-  lost** — and auto-resume at 00:00 UTC, or when you raise the cap / click
+  cost badge). When a team hits it, its agents pause, work is **held, not
+  lost**, and auto-resume at 00:00 UTC, or when you raise the cap / click
   *Resume anyway*. This is the safety net against an overnight runaway bill.
 - **Browser logins.** When an agent needs you to log in / clear a CAPTCHA, it
   posts a takeover request to your inbox. Click **Open browser** to drive its
-  (headless) session live from the dashboard, then **Done — hand back**. No
+  (headless) session live from the dashboard, then **Done, hand back**. No
   display needed on the server. (`SWARM_TAKEOVER_MODE=window` keeps the old
   pop-a-Chrome-window behaviour for local desktop use.)
 - **Health.** `GET /health` returns liveness to anyone and the full picture
-  (uptime, queue depth, LLM-backend reachability) to an authenticated caller —
+  (uptime, queue depth, LLM-backend reachability) to an authenticated caller,
   point your uptime monitor at it.
 - **Logs.** stdout always; set `SWARM_LOG_FILE` for an on-disk rotating trail.
 - **Data & backups.** All state is under `SWARM_DATA_DIR`; every config save

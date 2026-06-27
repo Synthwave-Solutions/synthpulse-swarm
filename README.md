@@ -1,48 +1,48 @@
 <div align="center">
 
-# Hermes Swarm
+# SynthPulse Swarm
 
-**Mission control for a self-hosted swarm of AI agents.**
+**Mission control for a self-hosted swarm of AI agents. By Synthwave Solutions.**
 
 A team of full [Hermes](https://github.com/NousResearch/hermes-agent) agents that
-browse, build, and publish - collaborating 24/7 on your own hardware - with one
-real-time console to command them.
+browse, build, and publish, collaborating 24/7 on your own hardware, with one
+real-time console to command them. Part of the SynthPulse Agentic Workstation.
 
-[Getting started](docs/getting-started.md) · [Deploy on a VPS](docs/deploy-vps.md) · [MIT licensed](#license)
+[Getting started](docs/getting-started.md) | [Deploy on a VPS](docs/deploy-vps.md) | [MIT licensed](#license)
 
 </div>
 
-![The Hermes Swarm dashboard - agent roster, supervisor/peer graph, live message history, and cost tracking](assets/dashboard.png)
+![The SynthPulse Swarm dashboard: agent roster, supervisor/peer graph, live message history, and cost tracking](assets/dashboard.png)
 
 ## Quick start
 
 > **Have an AI coding agent?** Paste one of these prompts into **Claude Code,
 > Codex, opencode, or Hermes itself** and it'll install and set up the whole swarm
-> for you — clone, dependencies, provider, and first run.
+> for you, clone, dependencies, provider, and first run.
 
 <details>
-<summary><b>📋 Local install prompt</b> — set it up on this machine</summary>
+<summary><b>📋 Local install prompt</b>, set it up on this machine</summary>
 
 ```text
-Install and run Hermes Swarm on this machine for me.
+Install and run SynthPulse Swarm on this machine for me.
 
-Hermes Swarm (https://github.com/CyberTron957/hermes-mission-control) is a
+SynthPulse Swarm (https://github.com/Synthwave-Solutions/synthpulse-swarm) is a
 self-hosted multi-agent server with a real-time dashboard.
 
 1. Check Python 3.11+ (or Docker). If missing, tell me before installing system packages.
 2. If ./hermes-swarm doesn't exist, clone the repo there. Run the installer
    non-interactively: `bash install.sh --no-run`. It auto-skips the interactive
    wizard when there's no TTY, so it won't hang. (Add `--no-browser` only if the
-   Chromium download fails — everything else still works.)
-3. Check whether a provider is already configured — run `.venv/bin/hermes-swarm doctor`.
-   If it already shows a model (e.g. an existing `~/.hermes` setup), ADOPT IT —
+   Chromium download fails, everything else still works.)
+3. Check whether a provider is already configured, run `.venv/bin/hermes-swarm doctor`.
+   If it already shows a model (e.g. an existing `~/.hermes` setup), ADOPT IT,
    don't ask me for keys, the swarm reuses it automatically. Skip to step 5.
 4. Only if NO provider is configured, ask me for:
      - provider (e.g. openai, anthropic, or "custom" for an OpenAI-compatible / proxy endpoint)
      - model name, API key, and base URL (base URL only for custom/proxy, e.g. http://localhost:4000/v1)
    Then set it with the supported NON-interactive command (do NOT edit Python internals):
      .venv/bin/hermes-swarm set-model --provider <p> --model <m> [--base-url <url>] --api-key <key>
-   Then tell me that `set-model` only sets the model — for web-search, vision,
+   Then tell me that `set-model` only sets the model, for web-search, vision,
    browser providers, memory, and reasoning-effort customization I can run the
    full wizard myself anytime: `.venv/bin/hermes-swarm setup`. Offer to run it.
 5. Verify: `.venv/bin/hermes-swarm doctor` (a "backend not reachable" warning is
@@ -51,7 +51,7 @@ self-hosted multi-agent server with a real-time dashboard.
      .venv/bin/hermes-swarm init
      .venv/bin/hermes-swarm up --detach   # daemonizes and returns; don't background it yourself
    It prints the URL once /health is up. Confirm with `.venv/bin/hermes-swarm status`.
-   (Use `up --detach`, NOT `nohup … &` — backgrounding it from your shell means it
+   (Use `up --detach`, NOT `nohup … &`, backgrounding it from your shell means it
    dies when your session/process group ends.)
 7. Tell me how to manage it and build my first team:
      - open the dashboard at http://127.0.0.1:8000 and use the Architect
@@ -59,30 +59,30 @@ self-hosted multi-agent server with a real-time dashboard.
      - stop it:       .venv/bin/hermes-swarm down
      - customize more: .venv/bin/hermes-swarm setup
 
-Keep my API key local — don't commit it or send it anywhere.
+Keep my API key local, don't commit it or send it anywhere.
 ```
 
 </details>
 
 <details>
-<summary><b>📋 VPS install prompt</b> — deploy it on a server, exposed safely</summary>
+<summary><b>📋 VPS install prompt</b>, deploy it on a server, exposed safely</summary>
 
 ```text
-Deploy Hermes Swarm on this VPS, exposed safely over HTTPS.
+Deploy SynthPulse Swarm on this VPS, exposed safely over HTTPS.
 
-Hermes Swarm (https://github.com/CyberTron957/hermes-mission-control) is a
+SynthPulse Swarm (https://github.com/Synthwave-Solutions/synthpulse-swarm) is a
 self-hosted multi-agent server. Its agents can run terminal commands as the
 server user, so containment and auth matter. Please:
 
 1. Read docs/deploy-vps.md in the repo and follow its hardened path. Prefer the
    Docker route so the agents' terminal access stays contained.
 2. Clone the repo and bring it up with Docker Compose (restart: unless-stopped).
-3. Generate a strong SWARM_API_KEY and set it — it must guard every endpoint and
+3. Generate a strong SWARM_API_KEY and set it, it must guard every endpoint and
    the WebSocket. Show it to me once and store it somewhere I can find it.
-4. Configure the LLM provider via `hermes setup` against the shared config —
+4. Configure the LLM provider via `hermes setup` against the shared config,
    PAUSE and ask me for the provider + API key.
-5. Put it behind a TLS reverse proxy (Caddy or nginx) for my domain — ask me for
-   the domain/subdomain — with automatic HTTPS.
+5. Put it behind a TLS reverse proxy (Caddy or nginx) for my domain, ask me for
+   the domain/subdomain, with automatic HTTPS.
 6. Lock down the firewall: only 80/443 and SSH open; do NOT expose the raw app
    port.
 7. Verify: GET /health returns ok, and the dashboard loads over HTTPS and prompts
@@ -97,10 +97,10 @@ file that could be committed.
 </details>
 
 
-**Or do it yourself — macOS & Linux, one line.** 
+**Or do it yourself, macOS & Linux, one line.** 
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/CyberTron957/hermes-mission-control/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Synthwave-Solutions/synthpulse-swarm/main/install.sh)
 ```
 
 
@@ -109,14 +109,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CyberTron957/hermes-mission-
 
 ```bash
 # Docker
-git clone https://github.com/CyberTron957/hermes-mission-control hermes-swarm && cd hermes-swarm
+git clone https://github.com/Synthwave-Solutions/synthpulse-swarm hermes-swarm && cd hermes-swarm
 docker compose run --rm swarm hermes-swarm setup  
 docker compose up --build
 ```
 or
 ```bash
 # From a clone 
-git clone https://github.com/CyberTron957/hermes-mission-control hermes-swarm && cd hermes-swarm
+git clone https://github.com/Synthwave-Solutions/synthpulse-swarm hermes-swarm && cd hermes-swarm
 bash install.sh
 ```
 

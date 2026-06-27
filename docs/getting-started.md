@@ -1,9 +1,9 @@
-# Getting Started with Hermes Swarm
+# Getting Started with SynthPulse Swarm
 
-A complete walkthrough — from downloading the project to running a multi-agent
+A complete walkthrough, from downloading the project to running a multi-agent
 team that works on its own and asks you for help when it needs it.
 
-> **What this is.** Hermes Swarm runs a team of AI agents that collaborate on a
+> **What this is.** SynthPulse Swarm runs a team of AI agents that collaborate on a
 > shared project 24/7. Each agent can browse the web, run a terminal, write
 > files, and publish to real platforms. You watch and steer the whole team from
 > one web dashboard. This guide assumes you're comfortable with a terminal, API
@@ -13,17 +13,17 @@ team that works on its own and asks you for help when it needs it.
 
 ## 1. What you need first
 
-1. **An LLM provider API key.** You'll configure it with **`hermes setup`** —
+1. **An LLM provider API key.** You'll configure it with **`hermes setup`**,
    Hermes' built-in wizard. It supports 40+ providers (Anthropic, OpenAI,
    [OpenRouter](https://openrouter.ai), Groq, DeepSeek, local models, …): pick
    one, paste your key, choose a model. The swarm reads that config directly, so
    there's nothing provider-specific to wire up separately. *(Using a
    [LiteLLM](https://github.com/BerriAI/litellm) proxy or any OpenAI-compatible
-   endpoint? It's just another provider — pick **custom** in `hermes setup` and
+   endpoint? It's just another provider, pick **custom** in `hermes setup` and
    enter its base URL + key.)*
 2. **Docker** *(recommended)* **or Python 3.11+**.
 
-You do **not** need to install Hermes (the agent runtime) separately — it's
+You do **not** need to install Hermes (the agent runtime) separately, it's
 pulled in automatically, and the `hermes` CLI comes with it.
 
 ---
@@ -32,10 +32,10 @@ pulled in automatically, and the `hermes` CLI comes with it.
 
 Each path ends with the dashboard on **http://127.0.0.1:8000**.
 
-### One line — macOS & Linux
+### One line, macOS & Linux
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/CyberTron957/hermes-mission-control/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Synthwave-Solutions/synthpulse-swarm/main/install.sh)
 ```
 
 That clones the repo, sets up a local `.venv`, installs everything, fetches a
@@ -64,7 +64,7 @@ config on the volume, so it persists). Using a LiteLLM proxy or other
 OpenAI-compatible endpoint? Choose **custom** and enter its base URL + key (for
 one on your host, use `http://host.docker.internal:<port>`).
 
-> `hermes-swarm doctor` is the fastest way to diagnose a bad install — it checks
+> `hermes-swarm doctor` is the fastest way to diagnose a bad install, it checks
 > that Hermes imports, a model is configured (and reachable), Chromium is
 > available, and the Hermes compat seams hold, telling you exactly what to fix.
 
@@ -74,18 +74,18 @@ one on your host, use `http://host.docker.internal:<port>`).
 
 Open the dashboard. The **default model** (the one new agents use unless you
 override per-agent) is whatever you picked in `hermes setup`. You can change it
-anytime from the dashboard — it reads the available models live and writes your
+anytime from the dashboard, it reads the available models live and writes your
 choice back to the same Hermes config.
 
-You now have an empty swarm. There are two ways to build your first team — let
+You now have an empty swarm. There are two ways to build your first team, let
 the **Architect** do it for you (recommended), or wire it by hand.
 
 ---
 
-## 4. Build a team — the easy way (the Architect)
+## 4. Build a team, the easy way (the Architect)
 
 Click **Architect** in the top bar. The Architect is an AI assistant that knows
-the whole framework. It is *not* part of any team — it's your team builder.
+the whole framework. It is *not* part of any team, it's your team builder.
 
 Tell it what you want to accomplish, e.g.:
 
@@ -95,9 +95,9 @@ Tell it what you want to accomplish, e.g.:
 It will:
 
 1. **Ask a few focused questions** about your goal and constraints.
-2. **Propose a team** — the agents, each agent's role ("soul"), who talks to
-   whom, and a shared brief — for you to review in chat.
-3. **Build it live once you approve** — create the agents, write their souls,
+2. **Propose a team**, the agents, each agent's role ("soul"), who talks to
+   whom, and a shared brief, for you to review in chat.
+3. **Build it live once you approve**, create the agents, write their souls,
    link them, seed the shared `workspace.md`, and offer to kick them off.
 
 You can also ask it to change an existing team later: *"add a QA agent to
@@ -108,33 +108,33 @@ acme"*, *"rewrite the coordinator's brief to be stricter about shipping"*.
 
 ---
 
-## 5. Build a team — by hand (concepts)
+## 5. Build a team, by hand (concepts)
 
 If you'd rather wire things yourself (or just want to understand what the
 Architect builds), here are the pieces. Everything below is editable live from
-the dashboard's ⚙️ panel — no restart.
+the dashboard's ⚙️ panel, no restart.
 
-- **Team** — a group of agents sharing one project directory and one shared
+- **Team**, a group of agents sharing one project directory and one shared
   brief. Create one with **+ New Team**.
-- **Agent** — one Hermes worker. Its key settings:
-  - **Role / soul** — a short charter (≈100–200 words) telling the agent who it
+- **Agent**, one Hermes worker. Its key settings:
+  - **Role / soul**, a short charter (≈100-200 words) telling the agent who it
     is and what it owns. Crisp, non-overlapping mandates work best.
-  - **Connections (peers)** — who this agent may message. **Connections are
+  - **Connections (peers)**, who this agent may message. **Connections are
     bidirectional**: linking A to B lets both message each other. Agents can
     only talk to peers on the same team.
-  - **Supervisor** — a supervisor periodically reviews its linked teammates'
+  - **Supervisor**, a supervisor periodically reviews its linked teammates'
     work and nudges them if they stall (good for a coordinator/manager role).
-  - **Autonomous** — an autonomous agent wakes itself on an interval to push the
+  - **Autonomous**, an autonomous agent wakes itself on an interval to push the
     mission forward without waiting for a task. Keep **one** autonomous "driver"
     per team (usually the coordinator) so the team has momentum without
     everyone self-triggering at once.
-  - **Model** — defaults to the swarm default; override per agent if you want a
+  - **Model**, defaults to the swarm default; override per agent if you want a
     cheaper model for grunt work and a stronger one for the lead.
-- **Shared workspace** — `workspace.md` is a shared brief injected into every
+- **Shared workspace**, `workspace.md` is a shared brief injected into every
   agent's context; the team's `project/` directory is their shared working area.
 
 You give an agent work by sending it a **task** from its card. From there it
-runs, calls tools, talks to peers, and reports back — all visible live.
+runs, calls tools, talks to peers, and reports back, all visible live.
 
 ---
 
@@ -142,24 +142,24 @@ runs, calls tools, talks to peers, and reports back — all visible live.
 
 The dashboard is your mission control:
 
-- **Live execution view** — watch each agent think → call a tool → answer, in
+- **Live execution view**, watch each agent think → call a tool → answer, in
   real time.
-- **Network view** — see the agents and the connections between them.
-- **Per-agent telemetry & config** — open an agent to see its state and tune it.
-- **Self-aware agents** — agents can read their own config and *propose* changes
+- **Network view**, see the agents and the connections between them.
+- **Per-agent telemetry & config**, open an agent to see its state and tune it.
+- **Self-aware agents**, agents can read their own config and *propose* changes
   (e.g. "raise my iteration limit"); you approve or reject from the inbox.
 
 ### The human inbox
 
-Agents ask you for things — a decision, a credential, or a login they can't do
+Agents ask you for things, a decision, a credential, or a login they can't do
 themselves. These land in the **Inbox** (top bar). Two kinds:
 
-- **Questions** — click **Respond** and type your answer; the agent resumes with
+- **Questions**, click **Respond** and type your answer; the agent resumes with
   it.
-- **Browser takeovers** — when an agent hits a login / CAPTCHA / 2FA, it asks
+- **Browser takeovers**, when an agent hits a login / CAPTCHA / 2FA, it asks
   you to take over its browser. Click **Open browser** to drive the agent's live
-  (headless) browser session right inside the dashboard — click, type, switch
-  tabs, navigate — then click **Done — hand back**. The agent resumes on the
+  (headless) browser session right inside the dashboard, click, type, switch
+  tabs, navigate, then click **Done, hand back**. The agent resumes on the
   now-authenticated session. This works even on a display-less server. (You can
   also click **Browser** in the top bar any time to watch a team's browser.)
 
@@ -178,17 +178,17 @@ takeover above rather than handing over a password.
 A 24/7 swarm on a paid API can run up a bill overnight. Set a **per-team daily
 budget**: click the cost badge in the top bar and enter a USD cap.
 
-When a team reaches its cap, its agents **pause** — in-flight work is **held,
-not lost** — and a banner appears. The team auto-resumes at **00:00 UTC**, or
+When a team reaches its cap, its agents **pause**, in-flight work is **held,
+not lost**, and a banner appears. The team auto-resumes at **00:00 UTC**, or
 immediately when you **Raise limit** or click **Resume anyway**. Leave it at 0
-for unlimited. (For models with no known price, set a token cap instead — the UI
+for unlimited. (For models with no known price, set a token cap instead, the UI
 warns you when that applies.)
 
 ---
 
 ## 8. Schedule recurring work (cron)
 
-Every agent can run work on a schedule — a 9am competitor check, an hourly
+Every agent can run work on a schedule, a 9am competitor check, an hourly
 metrics pull, a Monday digest. Add/enable/delete schedules from the agent's ⚙️
 panel using:
 
@@ -203,14 +203,14 @@ Agents can also schedule and cancel their own wake-ups via the
 
 ## 9. Going beyond your laptop (exposing it safely)
 
-By default the server binds `127.0.0.1` with no authentication — fine for local
+By default the server binds `127.0.0.1` with no authentication, fine for local
 use. **The moment you expose the port (VPS/LAN), set `SWARM_API_KEY`.** With it
 set, every endpoint *and* the live WebSocket require the key, and the dashboard
 prompts for it once (then remembers it in your browser).
 
 Also put it behind a TLS reverse proxy, and prefer the Docker route so agents'
-terminal access stays contained. Full hardened setup — Docker + Caddy/nginx, or
-bare-metal with the included systemd unit, plus a threat model — is in
+terminal access stays contained. Full hardened setup, Docker + Caddy/nginx, or
+bare-metal with the included systemd unit, plus a threat model, is in
 **[`docs/deploy-vps.md`](deploy-vps.md)**.
 
 ---
@@ -225,14 +225,14 @@ bare-metal with the included systemd unit, plus a threat model — is in
 - **Logs**: always on stdout (so `docker logs` / journald capture them). Set
   `SWARM_LOG_FILE=/path/to/swarm.log` for an on-disk rotating trail too.
 - **Health**: `GET /health` reports liveness to anyone and the full picture
-  (uptime, queue depth, LLM-backend reachability) to an authenticated caller —
+  (uptime, queue depth, LLM-backend reachability) to an authenticated caller,
   point an uptime monitor at it.
 
 ---
 
 ## 11. Restarts are safe
 
-Stop and restart the server freely — in-flight tasks are recovered and resumed,
+Stop and restart the server freely, in-flight tasks are recovered and resumed,
 conversation history persists, and a team that was over budget when you stopped
 stays correctly paused (the meter is rebuilt from history on startup). Browser
 logins persist across restarts too.
@@ -243,13 +243,13 @@ logins persist across restarts too.
 
 | Symptom | Fix |
 |---|---|
-| Dashboard loads but nothing works / 401s | `SWARM_API_KEY` is set — enter it when prompted (or unset it for local use). |
+| Dashboard loads but nothing works / 401s | `SWARM_API_KEY` is set, enter it when prompted (or unset it for local use). |
 | "Hermes NOT importable" | `pip install hermes-agent`, or set `HERMES_AGENT_PATH`. Run `hermes-swarm doctor`. |
-| "LLM backend NOT reachable" | Re-run `hermes setup` (or `hermes-swarm doctor`) — check the provider key, and for a custom endpoint that its base URL serves the chosen model. |
+| "LLM backend NOT reachable" | Re-run `hermes setup` (or `hermes-swarm doctor`), check the provider key, and for a custom endpoint that its base URL serves the chosen model. |
 | Browser tools unavailable | `playwright install chromium` (or install Chrome). Everything else still works. |
 | Agent/Architect can't read a page or describes a URL wrongly | `web_extract` had no backend. Search works out of the box; for extract either configure a Hermes web backend (Firecrawl/Tavily/Exa) or install `pip install .[web]` (crawl4ai) for JS-heavy sites. A configured Hermes backend is always used as-is. |
 | Agents idle and doing nothing | Send a task, or mark the coordinator **autonomous** so it self-drives. |
 | Costs climbing fast | Set a per-team daily budget (§7). |
 
-Run `hermes-swarm doctor` whenever something's off — it pinpoints which of the
+Run `hermes-swarm doctor` whenever something's off, it pinpoints which of the
 three prerequisites (Hermes, LLM backend, Chromium) is the problem.

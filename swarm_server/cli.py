@@ -206,7 +206,7 @@ def _serve(args) -> int:
 
     log = logging.getLogger("swarm")
     log.info("=" * 60)
-    log.info("  Hermes Swarm Server")
+    log.info("  SynthPulse Swarm Server")
     log.info("  Dashboard:    http://%s:%s/", SERVER_HOST, SERVER_PORT)
     try:
         from swarm_server.model_config import resolve_model, is_model_configured
